@@ -1,0 +1,344 @@
+"""
+Coverage configuration — single source of truth for the daily news pipeline.
+
+Maps coverage folder keys to Discord channels, market close windows,
+and Brave Search queries.
+"""
+
+from pathlib import Path
+
+WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
+COVERAGE_ROOT = WORKSPACE_ROOT / "coverage"
+
+# Coverage files evolved over time. Tickers use the canonical filenames while
+# older sector/market folders still use kpis.md / watchlist.md.
+COVERAGE_FILE_ALIASES: dict[str, tuple[str, ...]] = {
+    "kpi_tree.md": ("kpi_tree.md", "kpis.md"),
+    "catalysts.md": ("catalysts.md", "watchlist.md"),
+    "thesis.md": ("thesis.md",),
+    "debates.md": ("debates.md",),
+    "update_log.md": ("update_log.md",),
+}
+
+
+def resolve_coverage_file(coverage_path: Path, logical_name: str) -> Path:
+    """
+    Resolve a logical coverage filename to the best on-disk match.
+
+    If no alias exists on disk yet, return the canonical target path so callers
+    can still create or update the file predictably.
+    """
+    candidates = COVERAGE_FILE_ALIASES.get(logical_name, (logical_name,))
+    for candidate in candidates:
+        path = coverage_path / candidate
+        if path.exists():
+            return path
+    return coverage_path / candidates[0]
+
+# Discord server ID
+GUILD_ID = "1482651151932461131"
+
+# ── Coverage map ─────────────────────────────────────────────────────────────
+# Keys must match subfolders under coverage/
+# close: "us" | "asia_japan" | "asia_korea" | "asia_hk"
+
+COVERAGE = {
+    # ── Tickers: US close ─────────────────────────────────────────────────────
+    "tickers/JPM":  {"channel": "jpm",   "category": "TICKERS", "close": "us"},
+    "tickers/TMX":  {"channel": "tmx",   "category": "TICKERS", "close": "us"},
+    "tickers/STAN": {"channel": "stan",  "category": "TICKERS", "close": "us"},
+    "tickers/GRAB": {"channel": "grab",  "category": "TICKERS", "close": "us"},
+    "tickers/SE":   {"channel": "se",    "category": "TICKERS", "close": "us"},
+    "tickers/FUTU": {"channel": "futu",  "category": "TICKERS", "close": "us"},
+    "tickers/GOOG": {"channel": "goog",  "category": "TICKERS", "close": "us"},
+    "tickers/MMYT": {"channel": "mmyt",  "category": "TICKERS", "close": "us"},
+
+    # ── Tickers: Asia Japan close ─────────────────────────────────────────────
+    "tickers/8316": {"channel": "8316",  "category": "TICKERS", "close": "asia_japan"},
+
+    # ── Tickers: Asia HK close ────────────────────────────────────────────────
+    "tickers/1299": {"channel": "1299",  "category": "TICKERS", "close": "asia_hk"},
+
+    # ── Sectors: US close ─────────────────────────────────────────────────────
+    "sectors/exchanges":      {"channel": "exchanges",      "category": "SECTORS", "close": "us"},
+    "sectors/gold-miners":    {"channel": "gold-miners",    "category": "SECTORS", "close": "us"},
+    "sectors/uranium-miners": {"channel": "uranium-miners", "category": "SECTORS", "close": "us"},
+
+    # ── Sectors: Asia Japan close ─────────────────────────────────────────────
+    "sectors/japan-banks": {"channel": "japan-banks", "category": "SECTORS", "close": "asia_japan"},
+
+    # ── Sectors: Asia Korea close ───────────────────────────────────────────────
+    "sectors/korea-memory": {"channel": "korea-memory", "category": "SECTORS", "close": "asia_korea"},
+}
+
+# ── Market close windows (UTC) ────────────────────────────────────────────────
+# Asia windows use fixed UTC offsets (no DST).
+# The "us" window is DST-aware — resolved dynamically in daily_news.py via zoneinfo.
+# These static values are used only as fallback / documentation.
+
+CLOSE_WINDOWS = {
+    "asia_japan": {"hour": 6,  "minute": 0},   # 3:00 pm JST (UTC+9)
+    "asia_korea": {"hour": 6,  "minute": 30},  # 3:30 pm KST (UTC+9)
+    "asia_hk":    {"hour": 8,  "minute": 0},   # 4:00 pm HKT (UTC+8)
+    "us":         {"hour": 21, "minute": 0},   # 4:00 pm ET — overridden at runtime for DST
+}
+
+# ── Brave Search queries per coverage item ────────────────────────────────────
+
+SEARCH_QUERIES = {
+    # Tickers
+    "tickers/JPM":  "JPMorgan Chase JPM NII investment banking earnings credit",
+    "tickers/TMX":  "TMX Group Toronto Stock Exchange Trayport Montreal Exchange derivatives",
+    "tickers/STAN": "Standard Chartered STAN bank Asia China results",
+    "tickers/8316": "Sumitomo Mitsui SMFG 8316 megabank BOJ interest rates",
+    "tickers/GRAB": "Grab Holdings GRAB superapp SE Asia ride-hailing GrabFin earnings",
+    "tickers/SE":   "Sea Limited SE Shopee Garena SeaMoney e-commerce earnings",
+    "tickers/1299": "AIA Group 1299 HKEX life insurance Asia new business value VONB",
+    "tickers/FUTU": "Futu Holdings FUTU moomoo brokerage China AUC earnings",
+    "tickers/GOOG": "Alphabet Google GOOG search cloud GCP AI Overviews earnings antitrust",
+    "tickers/MMYT": "MakeMyTrip MMYT India travel OTA flights hotels earnings",
+
+    # Sectors
+    "sectors/exchanges":      "stock exchange operators CME ICE CBOE LSEG TMX volumes",
+    "sectors/japan-banks":    "Japan banks megabank BOJ rate hike MUFG SMFG Mizuho NIM",
+    "sectors/gold-miners":    "gold price gold miners GDX Newmont Barrick Agnico AISC central bank gold",
+    "sectors/uranium-miners": "uranium price nuclear energy URA Cameco Kazatomprom reactor restart AI power",
+
+    # Sectors (Asia)
+    "sectors/korea-memory": "Samsung SK Hynix HBM DRAM NAND memory semiconductor Korea AI chip demand capex",
+}
+
+# ── Preferred news sources ────────────────────────────────────────────────────
+# Ordered by priority — earlier entries rank higher in fetch_news.py.
+
+PREFERRED_SOURCES = [
+    "bloomberg.com",
+    "reuters.com",
+    "wsj.com",
+    "ft.com",
+    "economist.com",
+    "nikkei.com",
+    "scmp.com",
+    "financialtimes.com",  # alternate FT hostname
+    "marketwatch.com",
+    "cnbc.com",
+    "apnews.com",
+    "barrons.com",
+]
+
+# ── Blocked sources ───────────────────────────────────────────────────────────
+# Low-quality aggregators, copy sites, and opinion mills.
+# Articles from these are dropped before any LLM call.
+
+BLOCKED_SOURCES = [
+    "simplywall.st",
+    "fool.com",           # Motley Fool
+    "investopedia.com",   # educational, not news
+    "benzinga.com",
+    "finbold.com",
+    "financemagnates.com",
+    "investorplace.com",
+    "stockanalysis.com",
+    "zacks.com",
+    "gurufocus.com",
+    "tipranks.com",
+    "wallstreetmojo.com",
+    "macrotrends.net",
+    "seekingalpha.com",   # opinion/research marketplace, not primary news
+    "marketbeat.com",     # mostly ownership churn / secondary rewrites
+    "dailypolitical.com",
+    "watcher.guru",
+    "cryptoast.fr",
+    "moneylife.in",
+    "ad-hoc-news.de",               # German press release aggregator, no editorial filter
+    "newkerala.com",                 # low-authority Indian news aggregator
+    "markets.financialcontent.com",  # content syndication platform
+    "parameter.io",                  # unknown-provenance rewrites
+    "bestmediainfo.com",            # Indian media industry, not financial news
+    "worldecomag.com",              # unverified financial content site
+    "analyticsinsight.net",         # tech content farm, republishes/embellishes
+    "travelbizmonitor.com",         # low-quality trade aggregator
+    "rscapital.substack.com",       # retail investor Substack, no institutional credibility
+]
+
+# ── Filter context size limits ────────────────────────────────────────────────
+# Applied consistently in filter_material.py across Pass 1 and Pass 2.
+# Sized to fit ~800–1500 tokens per context block without mid-sentence truncation.
+
+MAX_KPI_CHARS      = 1500   # kpi_tree.md sent to Pass 1 (stripped) and Pass 2 (full)
+MAX_CATALYST_CHARS = 900    # catalysts near-term section
+MAX_THESIS_CHARS   = 900    # thesis variant view + risks (Pass 2 only)
+MAX_DEBATES_CHARS  = 1200   # current key debates / resolution criteria
+
+# ── Special channels (macro-open, catalyst-alerts, weekly-digest) ────────────
+# Created by discord_setup.py; IDs stored under these keys in channel_map.json.
+
+SPECIAL_CHANNELS = {
+    "special/daily-briefing":  {"channel": "daily-briefing",  "category": "DAILY-UPDATES"},
+    "special/macro-open":      {"channel": "macro-open",      "category": "DAILY-UPDATES"},
+    "special/catalyst-alerts": {"channel": "catalyst-alerts", "category": "DAILY-UPDATES"},
+    "special/breaking":        {"channel": "breaking",        "category": "DAILY-UPDATES"},
+    "special/weekly-digest":   {"channel": "weekly-digest",   "category": "WEEKLY"},
+    "special/self-eval":        {"channel": "self-eval",        "category": "META"},
+    "special/coverage-updates": {"channel": "coverage-updates", "category": "META"},
+    "special/earnings-uploads": {"channel": "earnings-uploads", "category": "META"},
+    "special/bot-commands":     {"channel": "bot-commands",     "category": "META"},
+    "special/twitter-signal":   {"channel": "twitter-signal",   "category": "SIGNALS"},
+}
+
+# ── Twitter signal config ─────────────────────────────────────────────────────
+TWITTER_SIGNAL_MAX_PER_RUN    = 10  # max Discord posts per run
+TWITTER_SIGNAL_LOOKBACK_HOURS = 2   # fetch tweets from last N hours
+
+# ── X / Twitter (optional — requires X API v2 credentials) ───────────────────
+# Set X_BEARER_TOKEN in .env to enable. Leave empty to skip.
+
+# ── Ticker metadata — used by earnings system ────────────────────────────────
+# sec_cik:  SEC EDGAR Central Index Key (10-digit, zero-padded). None = not a SEC filer.
+# ir_page:  Investor relations landing page (for transcript scraping).
+# av_symbol: Alpha Vantage symbol for earnings calendar / estimates.
+#            None = not covered by Alpha Vantage (non-US-listed).
+
+TICKER_META: dict[str, dict] = {
+    "tickers/JPM":  {
+        "sec_cik":  "0000019617",
+        "ir_page":  "https://www.jpmorganchase.com/ir/quarterly-earnings",
+        "av_symbol": "JPM",
+        "finnhub_symbol": "JPM",
+    },
+    "tickers/TMX":  {
+        "sec_cik":  None,          # TSX-listed (X.TO); files on SEDAR, not SEC
+        "ir_page":  "https://www.tmx.com/investor-relations",
+        "av_symbol": None,
+        "finnhub_symbol": None,    # TSX-listed; thin Finnhub coverage
+    },
+    "tickers/STAN": {
+        "sec_cik":  None,          # LSE-listed; does not file with SEC
+        "ir_page":  "https://www.sc.com/en/investors/results-and-reports/",
+        "av_symbol": None,
+        "finnhub_symbol": None,    # LSE-listed; not on Finnhub
+    },
+    "tickers/GRAB": {
+        "sec_cik":  "0001833928",
+        "ir_page":  "https://investors.grab.com/financial-information/quarterly-results",
+        "av_symbol": "GRAB",
+        "finnhub_symbol": "GRAB",
+    },
+    "tickers/SE":   {
+        "sec_cik":  "0001726445",
+        "ir_page":  "https://www.sea.com/investors/financials/results",
+        "av_symbol": "SE",
+        "finnhub_symbol": "SE",
+    },
+    "tickers/FUTU": {
+        "sec_cik":  "0001780731",
+        "ir_page":  "https://ir.futuholdings.com/financial-information/quarterly-results",
+        "av_symbol": "FUTU",
+        "finnhub_symbol": "FUTU",
+    },
+    "tickers/GOOG": {
+        "sec_cik":  "0001652044",
+        "ir_page":  "https://abc.xyz/investor/",
+        "av_symbol": "GOOG",
+        "finnhub_symbol": "GOOGL",
+    },
+    "tickers/MMYT": {
+        "sec_cik":  "0001403708",
+        "ir_page":  "https://investors.makemytrip.com/financial-information/quarterly-results",
+        "av_symbol": "MMYT",
+        "finnhub_symbol": "MMYT",
+    },
+    "tickers/8316": {
+        "sec_cik":  "0001023428",   # SMFG files 20-F with SEC
+        "ir_page":  "https://www.smfg.co.jp/english/investor/financial/",
+        "av_symbol": None,           # Not on Alpha Vantage
+        "finnhub_symbol": "SMFG",   # US-listed ADR
+    },
+    "tickers/1299": {
+        "sec_cik":  None,           # HKEx-listed; does not file with SEC
+        "ir_page":  "https://www.aia.com/en/investor-relations/results-and-reports",
+        "av_symbol": None,
+        "finnhub_symbol": None,    # HKEx-listed; not on Finnhub
+    },
+}
+
+# ── Future API key slots (add to .env when ready) ────────────────────────────
+# ALPHA_VANTAGE_KEY  — free tier: 25 req/day. Used for earnings calendar + estimates.
+# FINNHUB_API_KEY    — paid tier for transcripts and international data.
+# FMP_API_KEY        — FinancialModelingPrep for transcripts.
+# LINQALPHA_API_KEY  — LinqAlpha (no public API yet; upload transcripts to #earnings-uploads).
+
+# ── Portfolio briefing — price data and baseline ──────────────────────────────
+# YAHOO_SYMBOLS maps coverage key → yfinance ticker symbol.
+# Only ticker keys are included (sectors/markets have no single price series).
+# Currency notes:
+#   STAN.L  — quoted in GBX (pence), not GBP
+#   8316.T  — JPY
+#   1299.HK — HKD
+#   X.TO    — CAD
+
+YAHOO_SYMBOLS: dict[str, str] = {
+    "tickers/JPM":  "JPM",
+    "tickers/TMX":  "X.TO",
+    "tickers/STAN": "STAN.L",
+    "tickers/GRAB": "GRAB",
+    "tickers/SE":   "SE",
+    "tickers/FUTU": "FUTU",
+    "tickers/GOOG": "GOOGL",
+    "tickers/MMYT": "MMYT",
+    "tickers/8316": "8316.T",
+    "tickers/1299": "1299.HK",
+}
+
+# Anchor date for cumulative % calculations in portfolio_briefing.py.
+# Set once when tracking begins; update manually if you want to reset the baseline.
+BRIEFING_BASELINE_DATE: str = "2026-03-16"
+
+# ── X / Twitter (optional — requires X API v2 credentials) ───────────────────
+# Set X_BEARER_TOKEN in .env to enable. Leave empty to skip.
+
+# ── RSS feeds per coverage item ──────────────────────────────────────────────
+# Direct feeds from preferred financial outlets.  Higher quality and lower
+# latency than web search.  Each coverage key maps to a list of feed URLs.
+# Leave empty to skip RSS for that item.  Sector/market items get broad feeds;
+# tickers get sector-relevant feeds (there are no per-company RSS feeds).
+
+RSS_FEEDS: dict[str, list[str]] = {
+    # ── Broad financial feeds (shared across tickers) ────────────────────────
+    # These are reused in per-ticker lists below.
+}
+
+_RSS_REUTERS_BIZ  = "https://www.reutersagency.com/feed/?taxonomy=best-sectors&post_type=best"
+_RSS_CNBC_FINANCE = "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664"
+_RSS_CNBC_WORLD   = "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100727362"
+_RSS_MW_TOP       = "https://feeds.content.dowjones.io/public/rss/mw_realtimeheadlines"
+_RSS_NIKKEI       = "https://asia.nikkei.com/rss"
+
+RSS_FEEDS = {
+    # Tickers — sector-relevant feeds
+    "tickers/JPM":  [_RSS_CNBC_FINANCE, _RSS_MW_TOP],
+    "tickers/TMX":  [_RSS_MW_TOP],
+    "tickers/STAN": [_RSS_CNBC_WORLD, _RSS_REUTERS_BIZ],
+    "tickers/GRAB": [_RSS_CNBC_WORLD],
+    "tickers/SE":   [_RSS_CNBC_WORLD],
+    "tickers/FUTU": [_RSS_CNBC_WORLD],
+    "tickers/GOOG": [_RSS_CNBC_FINANCE, _RSS_MW_TOP],
+    "tickers/MMYT": [_RSS_CNBC_WORLD],
+    "tickers/8316": [_RSS_NIKKEI],
+    "tickers/1299": [_RSS_CNBC_WORLD],
+    # Sectors
+    "sectors/exchanges":      [_RSS_MW_TOP],
+    "sectors/gold-miners":    [_RSS_MW_TOP, _RSS_REUTERS_BIZ],
+    "sectors/uranium-miners": [_RSS_MW_TOP],
+    "sectors/japan-banks":    [_RSS_NIKKEI],
+    # Sectors (Asia)
+    "sectors/korea-memory": [_RSS_CNBC_WORLD, _RSS_NIKKEI],
+}
+
+X_ACCOUNTS: dict[str, list[str]] = {
+    "tickers/JPM":         ["jpmorgan"],
+    "tickers/8316":        [],
+    "tickers/GOOG":        ["Google", "sundarpichai"],
+    "sectors/japan-banks": ["BOJ_q"],
+    "sectors/gold-miners": [],
+}
