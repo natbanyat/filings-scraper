@@ -50,7 +50,7 @@ from fetch_news import (
     deduplicate, deduplicate_similar,
 )
 from filter_material import pass_one, pass_two
-from post_discord import build_embed, send_embed, send_text
+from post_discord import build_embed, send_embed, send_text, post_run_summary
 from cache import filter_unseen, mark_seen, posted_today, mark_posted, store_watchpoints
 from event_memory import index_event
 
@@ -241,7 +241,14 @@ def run(dry_run: bool = False) -> None:
     # ── Cross-ticker macro dedup ─────────────────────────────────────────
     # Remove articles appearing in 3+ different ticker briefs — these are macro
     # stories that belong in macro_close, not individual ticker briefs.
-    _macro_dedup_material(phase1_results)
+    macro_deduped_count = _macro_dedup_material(phase1_results)
+
+    # Collect run stats before pass2 (material counts reflect post-dedup state)
+    total_fetched = sum(r.get("articles_checked", 0) for r in phase1_results)
+    total_passed  = sum(len(r.get("material", [])) for r in phase1_results)
+    processed_names: list[str] = [r["name"] for r in phase1_results]
+    material_names: list[tuple[str, int]] = []
+    no_dev_names:   list[str] = []
 
     # ── Phase 2: Pass 2 + output for each ticker ─────────────────────────
     window_results = []
@@ -250,11 +257,35 @@ def run(dry_run: bool = False) -> None:
         log.info("── %s [Pass 2] ──────────────────────────────────", name)
 
         try:
-            result = _pass2_and_output(phase1, dry_run, channel_map)
+            result = _pass2_and_output(phase1, dry_run, channel_map, close_window=close_window)
             if result:
                 window_results.append(result)
+                material_names.append((name, len(phase1["material"])))
+            else:
+                no_dev_names.append(name)
         except Exception as exc:
             log.error("%s: Pass 2 error — %s", name, exc, exc_info=True)
+            no_dev_names.append(name)
+
+    # ── Run summary post ─────────────────────────────────────────────────
+    if not dry_run and processed_names:
+        summary_channel_id = channel_map.get("special/macro-close")
+        if summary_channel_id:
+            try:
+                post_run_summary(
+                    channel_id=summary_channel_id,
+                    close_window=close_window,
+                    coverage_processed=processed_names,
+                    material_names=material_names,
+                    no_development_names=no_dev_names,
+                    total_fetched=total_fetched,
+                    total_passed=total_passed,
+                    macro_deduped=macro_deduped_count,
+                )
+            except Exception as exc:
+                log.warning("Run summary post failed: %s", exc)
+        else:
+            log.debug("No special/macro-close channel in channel_map — skipping run summary")
 
     # ── Post-loop: cross-coverage event correlation ──────────────────────
     if len(window_results) >= 3:
@@ -420,11 +451,12 @@ def _fetch_and_pass1(
     }
 
 
-def _macro_dedup_material(phase1_results: list[dict]) -> None:
+def _macro_dedup_material(phase1_results: list[dict]) -> int:
     """
     Cross-ticker macro dedup: remove articles appearing (by URL or normalized title)
     in 3+ different tickers. Modifies each result's 'material' list in place.
     These are macro stories that belong in macro_close, not individual ticker briefs.
+    Returns total count of articles removed across all tickers.
     """
     import re as _re
 
@@ -453,8 +485,9 @@ def _macro_dedup_material(phase1_results: list[dict]) -> None:
     macro_titles = {t for t, names in title_tickers.items() if len(names) >= 3}
 
     if not macro_urls and not macro_titles:
-        return
+        return 0
 
+    total_removed = 0
     for r in phase1_results:
         before = len(r["material"])
         kept = []
@@ -468,17 +501,20 @@ def _macro_dedup_material(phase1_results: list[dict]) -> None:
                 kept.append(art)
         r["material"] = kept
         if removed_titles:
+            total_removed += len(removed_titles)
             log.info(
                 "%s: cross-ticker macro dedup removed %d/%d: %s",
                 r["name"], len(removed_titles), before,
                 "; ".join(removed_titles[:3]) + ("..." if len(removed_titles) > 3 else ""),
             )
+    return total_removed
 
 
 def _pass2_and_output(
     phase1: dict,
     dry_run: bool,
     channel_map: dict,
+    close_window: str = "",
 ) -> dict | None:
     """
     Phase 2: Pass 2 synthesis + Discord post + event log.
@@ -501,6 +537,7 @@ def _pass2_and_output(
             _write_null_entry(name, articles_checked)
             if channel_id:
                 send_text(channel_id, f"No material developments for {name} today.")
+                log.info("%s: posted plain 'no developments' message to channel %s", name, channel_id)
         return None
 
     # Step 4: Pass 2 — batched structured analysis (Sonnet, 1 call total)
@@ -563,7 +600,7 @@ def _pass2_and_output(
     if not channel_id:
         log.warning("%s: no channel ID in channel_map — run discord_setup.py", name)
     else:
-        embed = build_embed(name, brief, analyzed)
+        embed = build_embed(name, brief, analyzed, close_window=close_window)
         send_embed(channel_id, embed)
         log.info("%s: posted to #%s", name, COVERAGE[coverage_key]["channel"])
 
