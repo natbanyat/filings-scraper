@@ -1388,6 +1388,32 @@ async def run_council(
     save(session_dir, "SUMMARY.md", summary_md)
     print(f"  -> Saved SUMMARY.md")
 
+    # ── Index + passover ──────────────────────────────────────────────────────
+    verdict, confidence = _extract_verdict(summary_md)
+    _write_passover(
+        session_dir=session_dir,
+        question=question,
+        depth=depth,
+        n_agents=n_agents,
+        n_rounds=num_debate_rounds,
+        date_str=date_str,
+        registry=registry,
+        contract=contract,
+        summary_md=summary_md,
+        all_revisions=all_revisions,
+    )
+    _update_index(
+        session_dir=session_dir,
+        question=question,
+        depth=depth,
+        n_agents=n_agents,
+        n_rounds=num_debate_rounds,
+        date_str=date_str,
+        verdict=verdict,
+        confidence=confidence,
+    )
+    print(f"  -> Updated index.json  (verdict={verdict}, confidence={confidence})")
+
     print(f"\n{'='*60}")
     print(f"Council complete.")
     print(f"Session: {session_dir}")
@@ -1397,6 +1423,124 @@ async def run_council(
     print(summary_md)
 
     return session_dir
+
+
+# ── Index + passover helpers ───────────────────────────────────────────────────
+
+INDEX_PATH = SESSIONS_DIR / "index.json"
+
+
+def _extract_verdict(summary_md: str) -> tuple[str, str]:
+    """
+    Pull verdict and confidence from SUMMARY.md text.
+    Returns (verdict, confidence) — both default to "UNKNOWN" if not found.
+    """
+    # Answer line: first non-header word is the verdict
+    verdict = "UNKNOWN"
+    m = re.search(r"^## Answer\s*\n+\*?\*?([A-Z]+)\b", summary_md, re.MULTILINE)
+    if m:
+        verdict = m.group(1)
+
+    # PM Position line: "Overall confidence: LOW-MEDIUM" etc.
+    confidence = "UNKNOWN"
+    m = re.search(r"[Oo]verall confidence[:\s]+([A-Z][A-Z\-]+)", summary_md)
+    if m:
+        confidence = m.group(1).rstrip(".")
+
+    return verdict, confidence
+
+
+def _write_passover(
+    session_dir: Path,
+    question: str,
+    depth: str,
+    n_agents: int,
+    n_rounds: int,
+    date_str: str,
+    registry: list[dict],
+    contract: dict,
+    summary_md: str,
+    all_revisions: list,
+) -> None:
+    """
+    Write passover.json — context snapshot for future reruns or fallback analysis.
+    Does NOT implement rerun logic; this is data storage only.
+    """
+    verdict, confidence = _extract_verdict(summary_md)
+
+    # Extract falsifiers list from SUMMARY.md
+    falsifiers: list[str] = []
+    for m in re.finditer(r"^- \*\*F\d+[^*]*\*\*[:\s]+(.+)$", summary_md, re.MULTILINE):
+        falsifiers.append(m.group(1).strip()[:200])
+
+    passover = {
+        "format_version": "1",
+        "session_id":     session_dir.name,
+        "question":       question,
+        "depth":          depth,
+        "n_agents":       n_agents,
+        "n_debate_rounds": n_rounds,
+        "created_at":     datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "date":           date_str,
+        "verdict":        verdict,
+        "confidence":     confidence,
+        "evidence_registry": registry,
+        "contract":       contract,
+        "falsifiers":     falsifiers,
+        "view_revisions_count": len(all_revisions),
+        "note": "Passover file stores context for future reruns. Rerun logic not yet implemented.",
+    }
+    save(session_dir, "passover.json", json.dumps(passover, indent=2))
+    log.info("Saved passover.json (verdict=%s, confidence=%s)", verdict, confidence)
+
+
+def _update_index(
+    session_dir: Path,
+    question: str,
+    depth: str,
+    n_agents: int,
+    n_rounds: int,
+    date_str: str,
+    verdict: str,
+    confidence: str,
+) -> None:
+    """
+    Append or update entry in research/council-sessions/index.json.
+    Creates the file if it doesn't exist.
+    """
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+    entries: list[dict] = []
+    if INDEX_PATH.exists():
+        try:
+            entries = json.loads(INDEX_PATH.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            entries = []
+
+    # Deduplicate by session_id
+    entries = [e for e in entries if e.get("session_id") != session_dir.name]
+
+    entries.append({
+        "session_id":   session_dir.name,
+        "date":         date_str,
+        "question":     question,
+        "depth":        depth,
+        "n_agents":     n_agents,
+        "n_rounds":     n_rounds,
+        "verdict":      verdict,
+        "confidence":   confidence,
+        "session_dir":  str(session_dir.relative_to(WORKSPACE_ROOT)),
+        "summary_path": str((session_dir / "SUMMARY.md").relative_to(WORKSPACE_ROOT)),
+        "has_dashboard": (session_dir / "dashboard.html").exists(),
+        "has_passover":  True,
+        "created_at":   datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    })
+
+    # Sort descending by date then session_id
+    entries.sort(key=lambda e: (e.get("date", ""), e.get("session_id", "")), reverse=True)
+
+    INDEX_PATH.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+    log.info("Updated index.json — %d session(s) indexed", len(entries))
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────

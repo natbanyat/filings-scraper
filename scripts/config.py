@@ -179,7 +179,6 @@ SPECIAL_CHANNELS = {
     "special/catalyst-alerts": {"channel": "catalyst-alerts", "category": "DAILY-UPDATES"},
     "special/breaking":        {"channel": "breaking",        "category": "DAILY-UPDATES"},
     "special/weekly-digest":   {"channel": "weekly-digest",   "category": "WEEKLY"},
-    "special/self-eval":        {"channel": "self-eval",        "category": "META"},
     "special/coverage-updates": {"channel": "coverage-updates", "category": "META"},
     "special/earnings-uploads": {"channel": "earnings-uploads", "category": "META"},
     "special/bot-commands":     {"channel": "bot-commands",     "category": "META"},
@@ -188,7 +187,7 @@ SPECIAL_CHANNELS = {
 
 # ── Twitter signal config ─────────────────────────────────────────────────────
 TWITTER_SIGNAL_MAX_PER_RUN    = 10  # max Discord posts per run
-TWITTER_SIGNAL_LOOKBACK_HOURS = 2   # fetch tweets from last N hours
+TWITTER_SIGNAL_LOOKBACK_HOURS = 6   # fetch tweets from last N hours
 
 # ── X / Twitter (optional — requires X API v2 credentials) ───────────────────
 # Set X_BEARER_TOKEN in .env to enable. Leave empty to skip.
