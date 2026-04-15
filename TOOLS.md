@@ -96,6 +96,38 @@ Ticker news updates should answer:
 
 Do not save raw headlines without analysis.
 
+## External inbox handoff
+When a covered ticker, sector, or macro item has a material update, write one markdown file per ticker per story to:
+- Windows: `C:\Users\natba\OneDrive\@ Cowork\investing\inbox`
+- WSL: `/mnt/c/Users/natba/OneDrive/@ Cowork/investing/inbox`
+
+Filename format:
+- `YYYY-MM-DD_TICKER_type_brief-description.md`
+- Examples: `2026-04-15_STAN_news_africa-divestiture-update.md`, `2026-04-15_SECTOR_commentary_japan-rate-hike-implications.md`
+
+Required front matter:
+```yaml
+---
+type: [news | research | transcript | filing | commentary | data]
+ticker: [PRIMARY_TICKER or "SECTOR" or "MACRO"]
+tickers_mentioned: [TICKER1, TICKER2, ...]
+source: [publication name]
+source_url: [URL or "N/A"]
+date: [YYYY-MM-DD of source material]
+processed_date: [YYYY-MM-DD today]
+priority: [high | medium | low]
+tags: [comma-separated keywords]
+status: inbox
+---
+```
+
+Priority rules:
+- high: earnings surprise, guidance change, M&A, regulatory shift, or anything that directly challenges or confirms a thesis
+- medium: peer results, sector trends, management changes, relevant macro
+- low: background context, tangential news
+
+Only write a file if the update is material. If nothing is material on a run, write nothing.
+
 ## Macro close conventions
 Macro close updates should focus on:
 - what moved

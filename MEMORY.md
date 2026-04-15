@@ -143,3 +143,4 @@ Brave Search → dedup → cache filter → Pass 1 (Haiku) → Pass 2 (Sonnet, b
 - Credentials in `.env` (gitignored); `.env.example` has placeholder values only
 - Dry-run flag: `--dry-run` skips Discord posting and cache writes
 - No emojis in code or output unless explicitly requested
+- For material covered-ticker, sector, or macro updates, write one markdown inbox file per ticker/story to `C:\Users\natba\OneDrive\@ Cowork\investing\inbox` (`/mnt/c/Users/natba/OneDrive/@ Cowork/investing/inbox` in WSL) using filename format `YYYY-MM-DD_TICKER_type_brief-description.md`, exact YAML front matter, and `status: inbox`; write nothing if the update is not material
