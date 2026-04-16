@@ -513,6 +513,15 @@ def _macro_dedup_material(phase1_results: list[dict]) -> int:
     return total_removed
 
 
+def _is_unavailable_brief(brief: dict) -> bool:
+    return (
+        str(brief.get("thesis_line", "")).strip()
+        == "Material news was flagged, but the synthesized brief was unavailable."
+        and str(brief.get("what_changed", "")).strip()
+        == "Review the linked developments below for the KPI and thesis impact."
+    )
+
+
 def _pass2_and_output(
     phase1: dict,
     dry_run: bool,
@@ -550,6 +559,10 @@ def _pass2_and_output(
     brief    = analyzed_bundle.get("brief", {})
     analyzed = analyzed_bundle.get("articles", [])
     log.info("%s: Pass 2 → %d analyzed", name, len(analyzed))
+
+    if _is_unavailable_brief(brief):
+        log.warning("%s: synthesized brief unavailable after retries — suppressing post", name)
+        return None
 
     # Step 4b: Append material events to update_log.md for Cowork sync
     if not dry_run:
