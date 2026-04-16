@@ -279,6 +279,20 @@ def _article_sort_key(article: dict) -> tuple[int, int, str]:
     )
 
 
+def _run_pass_two_request(prompt: str, max_tokens: int) -> tuple[str, str | None]:
+    """Execute the Sonnet pass-two request and return (raw_text, stop_reason)."""
+    raw_parts: list[str] = []
+    with _get_client().messages.stream(
+        model="claude-sonnet-4-6",
+        max_tokens=max_tokens,
+        messages=[{"role": "user", "content": prompt}],
+    ) as stream:
+        for text in stream.text_stream:
+            raw_parts.append(text)
+        final_message = stream.get_final_message()
+    return "".join(raw_parts).strip(), final_message.stop_reason
+
+
 # ── Catalyst context loader ──────────────────────────────────────────────────
 
 _EARNINGS_CALENDAR_PATH = WORKSPACE_ROOT / "coverage" / "earnings_calendar.json"
@@ -550,35 +564,81 @@ Rules:
     # Previous floor of 1536 still truncated 3-article runs when Sonnet was detailed.
     max_tokens = min(6144, max(2560, 700 + 425 * len(articles)))
 
-    # Use streaming to keep TCP alive (WSL2 NAT drops idle connections after ~60s)
-    raw_parts: list[str] = []
-    with _get_client().messages.stream(
-        model="claude-sonnet-4-6",
-        max_tokens=max_tokens,
-        messages=[{"role": "user", "content": prompt}],
-    ) as stream:
-        for text in stream.text_stream:
-            raw_parts.append(text)
-        final_message = stream.get_final_message()
+    raw, stop_reason = _run_pass_two_request(prompt, max_tokens)
 
-    raw = "".join(raw_parts).strip()
-
-    if final_message.stop_reason == "max_tokens":
+    if stop_reason == "max_tokens":
         log.warning("Pass 2 (%s): response truncated at %d tokens — output may be incomplete", name, max_tokens)
 
     json_str = _extract_json_object(raw)
-    if not json_str:
-        log.warning("Pass 2: no JSON object returned for %s. Raw: %.300s", name, raw)
-        return {"brief": _fallback_brief(name, articles), "articles": articles}
+    payload = None
+    if json_str:
+        json_str = re.sub(r",\s*([}\]])", r"\1", json_str)
+        try:
+            payload = json.loads(json_str)
+        except json.JSONDecodeError as e:
+            log.warning("Pass 2: JSON parse error for %s: %s. Raw: %.500s", name, e, json_str)
 
-    # Strip trailing commas before } or ] (common LLM JSON mistake)
-    json_str = re.sub(r",\s*([}\]])", r"\1", json_str)
+    if payload is None:
+        retry_articles = articles[: min(3, len(articles))]
+        retry_block = "\n\n".join(
+            f"[{i}] Title: {a['title']}\n"
+            f"    Source: {a['source']}\n"
+            f"    Content: {a.get('body', a['description'])[:320]}\n"
+            f"    Driver: {a['kpi_node']}\n"
+            f"    Direction: {a['direction'].upper()}"
+            for i, a in enumerate(retry_articles)
+        )
+        retry_prompt = f"""You are a skeptical buy-side analyst covering {name}.
+Return ONLY valid JSON. Be terse. Analyze only the supplied articles.
+Every field must be short. Use at most 2 watchpoints and one sentence per field.
 
-    try:
-        payload = json.loads(json_str)
-    except json.JSONDecodeError as e:
-        log.warning("Pass 2: JSON parse error for %s: %s. Raw: %.500s", name, e, json_str)
-        return {"brief": _fallback_brief(name, articles), "articles": articles}
+PORTFOLIO CONTEXT:
+{name_context}
+{events_section}
+{market_section}
+
+ARTICLES TO ANALYZE:
+{retry_block}
+
+Return exactly this schema:
+{{
+  "brief": {{
+    "headline": "single sentence",
+    "thesis_line": "single sentence",
+    "what_changed": "1-2 short bullets or sentences",
+    "key_debate": "single sentence",
+    "watchpoints": ["watchpoint 1", "watchpoint 2"],
+    "overall_direction": "bull|bear|neutral|mixed"
+  }},
+  "articles": [
+    {{
+      "index": 0,
+      "event": "single sentence",
+      "kpi_node": "short driver label",
+      "direction": "BULL|BEAR|NEUTRAL",
+      "impact_type": "incremental|confirming|view-changing",
+      "why_it_matters": "single sentence",
+      "thesis_link": "single sentence",
+      "watch_next": "single sentence"
+    }}
+  ]
+}}"""
+        retry_max_tokens = 1800
+        retry_raw, retry_stop_reason = _run_pass_two_request(retry_prompt, retry_max_tokens)
+        if retry_stop_reason == "max_tokens":
+            log.warning("Pass 2 compact retry (%s): response truncated at %d tokens", name, retry_max_tokens)
+        retry_json = _extract_json_object(retry_raw)
+        if retry_json:
+            retry_json = re.sub(r",\s*([}\]])", r"\1", retry_json)
+            try:
+                payload = json.loads(retry_json)
+                articles = retry_articles
+                log.info("Pass 2 (%s): compact retry succeeded with %d article(s)", name, len(articles))
+            except json.JSONDecodeError as e:
+                log.warning("Pass 2 compact retry: JSON parse error for %s: %s. Raw: %.500s", name, e, retry_json)
+        if payload is None:
+            log.warning("Pass 2: no JSON object returned for %s after retry. Raw: %.300s", name, retry_raw or raw)
+            return {"brief": _fallback_brief(name, articles), "articles": articles}
 
     if isinstance(payload, list):
         brief = _fallback_brief(name, articles)
