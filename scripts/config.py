@@ -348,6 +348,11 @@ RSS_MATCH_TERMS: dict[str, list[str]] = {
     "tickers/MMYT": ["makemytrip", "make my trip", "goibibo", "redbus", "mybiz"],
     "tickers/8316": ["sumitomo mitsui", "smfg", "smcc", "olive"],
     "tickers/1299": ["aia"],
+    "sectors/exchanges": ["exchange", "trading venue", "bourse", "cme", "ice", "cboe", "lseg", "tmx", "nasdaq", "nyse", "ipo", "listing"],
+    "sectors/gold-miners": ["gold", "miner", "mining", "newmont", "barrick", "agnico", "kinross", "aisc", "gdx"],
+    "sectors/uranium-miners": ["uranium", "nuclear", "reactor", "cameco", "kazatomprom", "yellowcake", "u3o8", "ura"],
+    "sectors/japan-banks": ["boj", "bank of japan", "megabank", "mufg", "smfg", "mizuho", "jgb", "japan bank"],
+    "sectors/korea-memory": ["samsung", "sk hynix", "hbm", "dram", "nand", "memory", "semiconductor", "chip", "fab", "cxmt", "micron"],
 }
 
 X_ACCOUNTS: dict[str, list[str]] = {

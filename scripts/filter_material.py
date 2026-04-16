@@ -20,12 +20,18 @@ Pass 2 (Sonnet, batched):
 import json
 import logging
 import re
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
 
 import anthropic
 
 from utils import retry
+from bounded_router import run_json_task
 
 log = logging.getLogger(__name__)
 
@@ -46,6 +52,12 @@ TICKER_SPECIFICITY_HINTS: dict[str, str] = {
         "(IndiGo, Air India, SpiceJet), Indian hotel chains, India outbound travel, Yatra, or direct "
         "India consumer travel data. Exclude geopolitical macro (oil, West Asia tensions, FX moves) "
         "unless it reports actual India flight cancellations, route suspensions, or India fare data."
+    ),
+    "sectors/korea-memory": (
+        "KOREA-MEMORY-specific: Only include articles about Samsung Electronics memory, SK Hynix, Micron, "
+        "HBM, DRAM, NAND, wafer pricing, memory capex, fab utilization, packaging constraints, CXMT, or "
+        "AI server memory demand. Exclude broad geopolitics, oil, tariffs, or macro risk-off stories unless "
+        "they explicitly discuss semiconductor supply chains, fab costs, memory pricing, or Korean chipmakers."
     ),
 }
 
@@ -109,6 +121,7 @@ def _extract_name_context(portfolio_text: str, name: str, coverage_key: str) -> 
         "sectors/exchanges": "exchanges",
         "markets/japan": "Japan banks",
         "markets/korea": "Korea",
+        "sectors/korea-memory": "Korea",
     }
     sector_hint = sector_map.get(coverage_key, "")
 
@@ -416,29 +429,18 @@ Rules:
 - direction: bull = positive for the thesis, bear = negative, neutral = watch but unclear
 - kpi_node: a short label for the key driver affected (e.g. "NII", "BOJ rate path", "GCP revenue")"""
 
-    # Use streaming to keep TCP alive (WSL2 NAT drops idle connections)
-    raw_parts: list[str] = []
-    with _get_client().messages.stream(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=512,
-        messages=[{"role": "user", "content": prompt}],
-    ) as stream:
-        for text in stream.text_stream:
-            raw_parts.append(text)
-
-    raw = "".join(raw_parts).strip()
-
-    # Extract JSON array
-    match = re.search(r"\[.*\]", raw, re.DOTALL)
-    if not match:
-        log.warning("Pass 1: model returned no JSON array for %s. Raw response: %.200s", name, raw)
-        return []
-
     try:
-        hits = json.loads(match.group())
-    except json.JSONDecodeError as e:
-        log.warning("Pass 1: JSON parse error for %s: %s. Raw: %.200s", name, e, raw)
+        hits, route = run_json_task(
+            task_class="materiality_filter",
+            prompt=prompt,
+            expected="array",
+            max_tokens=512,
+        )
+    except Exception as e:
+        log.warning("Pass 1: bounded routing failed for %s: %s", name, e)
         return []
+
+    log.info("Pass 1 route (%s): %s via %s", name, route.tier, route.model)
 
     result = []
     for h in hits:
@@ -546,7 +548,7 @@ Rules:
     # what_changed bullets, key_debate, 3 watchpoints, direction).
     # Each article adds ~250-350 tokens of structured analysis.
     # Previous floor of 1536 still truncated 3-article runs when Sonnet was detailed.
-    max_tokens = min(6144, max(2048, 500 * len(articles)))
+    max_tokens = min(6144, max(2560, 700 + 425 * len(articles)))
 
     # Use streaming to keep TCP alive (WSL2 NAT drops idle connections after ~60s)
     raw_parts: list[str] = []
