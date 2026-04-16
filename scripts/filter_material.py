@@ -59,6 +59,9 @@ TICKER_SPECIFICITY_HINTS: dict[str, str] = {
         "AI server memory demand. Exclude broad geopolitics, oil, tariffs, or macro risk-off stories unless "
         "they explicitly discuss semiconductor supply chains, fab costs, memory pricing, or Korean chipmakers."
     ),
+    "sectors/exchanges": (
+        "EXCHANGES-specific: Only include articles about listed exchange operators (TMX, CME, ICE, CBOE, LSEG, HKEX, Nasdaq, NYSE, Deutsche Boerse), their clearing/post-trade/data businesses, actual exchange trading volumes, capital-raising pipelines, or exchange regulation. Exclude broad geopolitics, commodity volatility, generic IPO stories, crypto exchanges/token listings, and unrelated capital-markets commentary unless the article explicitly cites exchange operator volumes, fee pools, clearing/margin impacts, or a named listed exchange operator."
+    ),
 }
 
 _client: anthropic.Anthropic | None = None

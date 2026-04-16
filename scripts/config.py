@@ -159,6 +159,8 @@ BLOCKED_SOURCES = [
     "analyticsinsight.net",         # tech content farm, republishes/embellishes
     "travelbizmonitor.com",         # low-quality trade aggregator
     "rscapital.substack.com",       # retail investor Substack, no institutional credibility
+    "manilatimes.net",              # low-quality syndicated business wire / low signal for this pipeline
+    "indiatimes.com",               # broad liveblogs / low signal for institutional market work
 ]
 
 # ── Filter context size limits ────────────────────────────────────────────────
@@ -348,7 +350,7 @@ RSS_MATCH_TERMS: dict[str, list[str]] = {
     "tickers/MMYT": ["makemytrip", "make my trip", "goibibo", "redbus", "mybiz"],
     "tickers/8316": ["sumitomo mitsui", "smfg", "smcc", "olive"],
     "tickers/1299": ["aia"],
-    "sectors/exchanges": ["exchange", "trading venue", "bourse", "cme", "ice", "cboe", "lseg", "tmx", "nasdaq", "nyse", "ipo", "listing"],
+    "sectors/exchanges": ["trayport", "cme", "ice", "cboe", "lseg", "tmx", "hkex", "nasdaq", "nyse", "eurex", "lch", "clearing", "post-trade", "market data", "index", "exchange operator"],
     "sectors/gold-miners": ["gold", "miner", "mining", "newmont", "barrick", "agnico", "kinross", "aisc", "gdx"],
     "sectors/uranium-miners": ["uranium", "nuclear", "reactor", "cameco", "kazatomprom", "yellowcake", "u3o8", "ura"],
     "sectors/japan-banks": ["boj", "bank of japan", "megabank", "mufg", "smfg", "mizuho", "jgb", "japan bank"],
