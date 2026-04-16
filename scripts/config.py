@@ -186,8 +186,8 @@ SPECIAL_CHANNELS = {
 }
 
 # ── Twitter signal config ─────────────────────────────────────────────────────
-TWITTER_SIGNAL_MAX_PER_RUN    = 10  # max Discord posts per run
-TWITTER_SIGNAL_LOOKBACK_HOURS = 6   # fetch tweets from last N hours
+TWITTER_SIGNAL_MAX_PER_RUN    = 5   # max Discord posts per run
+TWITTER_SIGNAL_LOOKBACK_HOURS = 10  # fetch tweets from last N hours (fallback if --since-ts not provided)
 
 # ── X / Twitter (optional — requires X API v2 credentials) ───────────────────
 # Set X_BEARER_TOKEN in .env to enable. Leave empty to skip.
@@ -332,6 +332,22 @@ RSS_FEEDS = {
     "sectors/japan-banks":    [_RSS_NIKKEI],
     # Sectors (Asia)
     "sectors/korea-memory": [_RSS_CNBC_WORLD, _RSS_NIKKEI],
+}
+
+# Broad RSS feeds can leak unrelated stories into single-name pipelines.
+# For single-ticker coverage, require at least one alias/brand mention in the
+# RSS title/summary before the article enters Pass 1.
+RSS_MATCH_TERMS: dict[str, list[str]] = {
+    "tickers/JPM":  ["jpmorgan", "jp morgan", "chase"],
+    "tickers/TMX":  ["tmx", "toronto stock exchange", "tsx", "trayport", "montreal exchange"],
+    "tickers/STAN": ["standard chartered", "stanchart"],
+    "tickers/GRAB": ["grab", "grabfin", "grabfood", "grabcar", "grabmart"],
+    "tickers/SE":   ["sea limited", "shopee", "garena", "seamoney", "sea ltd"],
+    "tickers/FUTU": ["futu", "moomoo"],
+    "tickers/GOOG": ["alphabet", "google", "youtube", "android", "waymo", "gcp"],
+    "tickers/MMYT": ["makemytrip", "make my trip", "goibibo", "redbus", "mybiz"],
+    "tickers/8316": ["sumitomo mitsui", "smfg", "smcc", "olive"],
+    "tickers/1299": ["aia"],
 }
 
 X_ACCOUNTS: dict[str, list[str]] = {

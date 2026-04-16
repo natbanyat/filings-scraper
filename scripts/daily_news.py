@@ -41,7 +41,7 @@ log = setup_logging("daily_news")
 # ── Imports ───────────────────────────────────────────────────────────────────
 from config import (
     COVERAGE, COVERAGE_ROOT, CLOSE_WINDOWS, SEARCH_QUERIES, X_ACCOUNTS,
-    TICKER_META, YAHOO_SYMBOLS, RSS_FEEDS,
+    TICKER_META, YAHOO_SYMBOLS, RSS_FEEDS, RSS_MATCH_TERMS,
 )
 from fetch_news import (
     fetch_news, fetch_finnhub_news, fetch_x_mentions,
@@ -369,7 +369,10 @@ def _fetch_and_pass1(
 
     if rss_feeds:
         try:
-            rss_articles = fetch_rss_news(rss_feeds)
+            rss_articles = fetch_rss_news(
+                rss_feeds,
+                match_terms=RSS_MATCH_TERMS.get(coverage_key),
+            )
         except Exception as exc:
             log.warning("%s: RSS fetch failed: %s", name, exc)
 
@@ -532,12 +535,10 @@ def _pass2_and_output(
 
     # Handle zero-material case cleanly — do not call Pass 2
     if not material:
-        log.info("%s: no material news today", name)
+        log.info("%s: no material news today — skipping Discord post", name)
         if not dry_run:
             _write_null_entry(name, articles_checked)
-            if channel_id:
-                send_text(channel_id, f"No material developments for {name} today.")
-                log.info("%s: posted plain 'no developments' message to channel %s", name, channel_id)
+            # No Discord notification when nothing is material — silence is the signal
         return None
 
     # Step 4: Pass 2 — batched structured analysis (Sonnet, 1 call total)
