@@ -101,6 +101,8 @@ def write_daily_inbox_item(
     brief: dict,
     analyzed: list[dict],
     output_dir: Path | None = None,
+    source_label: str = "OpenClaw daily brief",
+    item_type: str = "commentary",
 ) -> Path:
     out_dir = output_dir or INBOX_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -109,7 +111,7 @@ def write_daily_inbox_item(
     ticker = _coverage_primary_ticker(coverage_key)
     headline = _clean_text(brief.get("headline")) or f"{name} material update"
     slug = _slugify(headline, fallback=_slugify(name))
-    filename = f"{today}_{ticker}_commentary_{slug}.md"
+    filename = f"{today}_{ticker}_{item_type}_{slug}.md"
     out_path = _next_available_path(out_dir, filename)
 
     tickers_mentioned: list[str] = []
@@ -126,10 +128,10 @@ def write_daily_inbox_item(
 
     frontmatter = "\n".join([
         "---",
-        "type: commentary",
+        f"type: {item_type}",
         f"ticker: {ticker}",
         f"tickers_mentioned: {_inline_yaml_list(tickers_mentioned)}",
-        "source: OpenClaw daily brief",
+        f"source: {source_label}",
         f"priority: {_daily_priority(analyzed)}",
         f"tags: {_inline_yaml_list(tags)}",
         "status: inbox",

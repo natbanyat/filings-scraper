@@ -63,9 +63,12 @@ COVERAGE = {
     "tickers/MMYT": {"channel": "mmyt",  "category": "TICKERS", "close": "us"},
 
     # ── Tickers: Asia Japan close ─────────────────────────────────────────────
+    "tickers/MUFG": {"channel": "mufg",  "category": "TICKERS", "close": "asia_japan"},
+    "tickers/MFG":  {"channel": "mfg",   "category": "TICKERS", "close": "asia_japan"},
     "tickers/8316": {"channel": "8316",  "category": "TICKERS", "close": "asia_japan"},
 
     # ── Tickers: Asia HK close ────────────────────────────────────────────────
+    "tickers/HSBC": {"channel": "hsbc",  "category": "TICKERS", "close": "asia_hk"},
     "tickers/1299": {"channel": "1299",  "category": "TICKERS", "close": "asia_hk"},
 
     # ── Sectors: US close ─────────────────────────────────────────────────────
@@ -78,6 +81,9 @@ COVERAGE = {
 
     # ── Sectors: Asia Korea close ───────────────────────────────────────────────
     "sectors/korea-memory": {"channel": "korea-memory", "category": "SECTORS", "close": "asia_korea"},
+
+    # ── Markets: Asia Korea close ───────────────────────────────────────────────
+    "markets/korea": {"channel": "korea", "category": "MARKETS", "close": "asia_korea"},
 }
 
 # ── Market close windows (UTC) ────────────────────────────────────────────────
@@ -99,6 +105,9 @@ SEARCH_QUERIES = {
     "tickers/JPM":  "JPMorgan Chase JPM NII investment banking earnings credit",
     "tickers/TMX":  "TMX Group Toronto Stock Exchange Trayport Montreal Exchange derivatives",
     "tickers/STAN": "Standard Chartered STAN bank Asia China results",
+    "tickers/HSBC": "HSBC Holdings Hong Kong wealth NII capital return results",
+    "tickers/MUFG": "Mitsubishi UFJ MUFG 8306 megabank BOJ rates Morgan Stanley stake",
+    "tickers/MFG":  "Mizuho Financial Group MFG 8411 megabank BOJ rates advisory results",
     "tickers/8316": "Sumitomo Mitsui SMFG 8316 megabank BOJ interest rates",
     "tickers/GRAB": "Grab Holdings GRAB superapp SE Asia ride-hailing GrabFin earnings",
     "tickers/SE":   "Sea Limited SE Shopee Garena SeaMoney e-commerce earnings",
@@ -115,6 +124,107 @@ SEARCH_QUERIES = {
 
     # Sectors (Asia)
     "sectors/korea-memory": "Samsung SK Hynix HBM DRAM NAND memory semiconductor Korea AI chip demand capex",
+
+    # Markets
+    "markets/korea": "Korea market EWY KOSPI won Samsung SK Hynix Value-Up reform foreign flows",
+}
+
+# ── Inbox-only watchlist monitor ─────────────────────────────────────────────
+# These names do not get Discord posts. They are scanned for material articles
+# and routed to the OneDrive inbox as notes when something looks actionable.
+
+WATCHLIST_ITEMS: dict[str, dict] = {
+    "PRU": {
+        "ticker": "PRU",
+        "name": "Prudential plc",
+        "close": "asia_hk",
+        "query": "Prudential plc PRU Asia insurer Hong Kong Indonesia new business profit",
+        "match_terms": ["prudential", "pru", "jackson", "new business profit", "ape", "embedded value"],
+    },
+    "HKEX": {
+        "ticker": "HKEX",
+        "name": "Hong Kong Exchanges and Clearing",
+        "close": "asia_hk",
+        "query": "HKEX Hong Kong Exchanges and Clearing IPO turnover Stock Connect derivatives",
+        "match_terms": ["hkex", "hong kong exchanges", "stock connect", "hong kong exchanges and clearing"],
+    },
+    "HANG-LUNG": {
+        "ticker": "HANG-LUNG",
+        "name": "Hang Lung Properties",
+        "close": "asia_hk",
+        "query": "Hang Lung Properties Hong Kong retail office China luxury mall results",
+        "match_terms": ["hang lung", "hang lung properties", "plaza 66"],
+    },
+    "KYOTOFG": {
+        "ticker": "KYOTOFG",
+        "name": "Kyoto Financial Group",
+        "close": "asia_japan",
+        "query": "Kyoto Financial Group regional bank Japan BOJ rates results",
+        "match_terms": ["kyoto financial", "kyotofg", "kyoto fg"],
+    },
+    "RESONA": {
+        "ticker": "RESONA",
+        "name": "Resona Holdings",
+        "close": "asia_japan",
+        "query": "Resona Holdings Japan bank BOJ rates capital return results",
+        "match_terms": ["resona"],
+    },
+    "CHIBA": {
+        "ticker": "CHIBA",
+        "name": "Chiba Bank",
+        "close": "asia_japan",
+        "query": "Chiba Bank Japan regional bank BOJ rates results",
+        "match_terms": ["chiba bank"],
+    },
+    "DAIWAHOUSE": {
+        "ticker": "DAIWAHOUSE",
+        "name": "Daiwa House Industry",
+        "close": "asia_japan",
+        "query": "Daiwa House Industry Japan property developer housing logistics results",
+        "match_terms": ["daiwa house", "daiwa house industry"],
+    },
+    "MEC": {
+        "ticker": "MEC",
+        "name": "Mitsubishi Estate",
+        "close": "asia_japan",
+        "query": "Mitsubishi Estate Japan office property Marunouchi JREIT results",
+        "match_terms": ["mitsubishi estate", "marunouchi"],
+    },
+    "MQG": {
+        "ticker": "MQG",
+        "name": "Macquarie Group",
+        "close": "us",
+        "query": "Macquarie Group MQG infrastructure asset management commodities results",
+        "match_terms": ["macquarie", "mqg", "mam", "commodities and global markets"],
+    },
+    "GDG": {
+        "ticker": "GDG",
+        "name": "Generation Development Group",
+        "close": "us",
+        "query": "Generation Development Group GDG retirement income LifeIncome results managed accounts",
+        "match_terms": ["generation development group", "gdg", "lifeincome"],
+    },
+    "CGF": {
+        "ticker": "CGF",
+        "name": "Challenger Limited",
+        "close": "us",
+        "query": "Challenger Limited CGF annuities retirement income Australia results",
+        "match_terms": ["challenger", "cgf", "annuities"],
+    },
+    "ERSTE": {
+        "ticker": "ERSTE",
+        "name": "Erste Group",
+        "close": "us",
+        "query": "Erste Group Bank CEE bank Austria results NII capital",
+        "match_terms": ["erste group", "erste", "erste bank"],
+    },
+    "IBKR": {
+        "ticker": "IBKR",
+        "name": "Interactive Brokers",
+        "close": "us",
+        "query": "Interactive Brokers IBKR DARTs net interest margin client accounts results",
+        "match_terms": ["interactive brokers", "ibkr", "darts", "client accounts", "net interest income"],
+    },
 }
 
 # ── Preferred news sources ────────────────────────────────────────────────────
@@ -216,6 +326,12 @@ TICKER_META: dict[str, dict] = {
         "av_symbol": "JPM",
         "finnhub_symbol": "JPM",
     },
+    "tickers/HSBC": {
+        "sec_cik":  None,
+        "ir_page":  "https://www.hsbc.com/investors/results-and-announcements",
+        "av_symbol": None,
+        "finnhub_symbol": "HSBC",
+    },
     "tickers/TMX":  {
         "sec_cik":  None,          # TSX-listed (X.TO); files on SEDAR, not SEC
         "ir_page":  "https://www.tmx.com/investor-relations",
@@ -227,6 +343,18 @@ TICKER_META: dict[str, dict] = {
         "ir_page":  "https://www.sc.com/en/investors/results-and-reports/",
         "av_symbol": None,
         "finnhub_symbol": None,    # LSE-listed; not on Finnhub
+    },
+    "tickers/MUFG": {
+        "sec_cik":  None,
+        "ir_page":  "https://www.mufg.jp/english/ir/financialinfo/index.html",
+        "av_symbol": None,
+        "finnhub_symbol": "MUFG",
+    },
+    "tickers/MFG": {
+        "sec_cik":  None,
+        "ir_page":  "https://www.mizuhogroup.com/investors",
+        "av_symbol": None,
+        "finnhub_symbol": "MFG",
     },
     "tickers/GRAB": {
         "sec_cik":  "0001833928",
@@ -289,8 +417,11 @@ TICKER_META: dict[str, dict] = {
 
 YAHOO_SYMBOLS: dict[str, str] = {
     "tickers/JPM":  "JPM",
+    "tickers/HSBC": "0005.HK",
     "tickers/TMX":  "X.TO",
     "tickers/STAN": "STAN.L",
+    "tickers/MUFG": "8306.T",
+    "tickers/MFG":  "8411.T",
     "tickers/GRAB": "GRAB",
     "tickers/SE":   "SE",
     "tickers/FUTU": "FUTU",
@@ -327,8 +458,11 @@ _RSS_NIKKEI       = "https://asia.nikkei.com/rss"
 RSS_FEEDS = {
     # Tickers — sector-relevant feeds
     "tickers/JPM":  [_RSS_CNBC_FINANCE, _RSS_MW_TOP],
+    "tickers/HSBC": [_RSS_CNBC_WORLD, _RSS_REUTERS_BIZ],
     "tickers/TMX":  [_RSS_MW_TOP],
     "tickers/STAN": [_RSS_CNBC_WORLD, _RSS_REUTERS_BIZ],
+    "tickers/MUFG": [_RSS_NIKKEI, _RSS_REUTERS_BIZ],
+    "tickers/MFG":  [_RSS_NIKKEI, _RSS_REUTERS_BIZ],
     "tickers/GRAB": [_RSS_CNBC_WORLD],
     "tickers/SE":   [_RSS_CNBC_WORLD],
     "tickers/FUTU": [_RSS_CNBC_WORLD],
@@ -343,6 +477,8 @@ RSS_FEEDS = {
     "sectors/japan-banks":    [_RSS_NIKKEI],
     # Sectors (Asia)
     "sectors/korea-memory": [_RSS_CNBC_WORLD, _RSS_NIKKEI],
+    # Markets
+    "markets/korea": [_RSS_CNBC_WORLD, _RSS_NIKKEI],
 }
 
 # Broad RSS feeds can leak unrelated stories into single-name pipelines.
@@ -350,8 +486,11 @@ RSS_FEEDS = {
 # RSS title/summary before the article enters Pass 1.
 RSS_MATCH_TERMS: dict[str, list[str]] = {
     "tickers/JPM":  ["jpmorgan", "jp morgan", "chase"],
+    "tickers/HSBC": ["hsbc", "hang seng bank", "mid east", "hong kong wealth"],
     "tickers/TMX":  ["tmx", "toronto stock exchange", "tsx", "trayport", "montreal exchange"],
     "tickers/STAN": ["standard chartered", "stanchart"],
+    "tickers/MUFG": ["mufg", "mitsubishi ufj", "bank of tokyo-mitsubishi", "morgan stanley stake"],
+    "tickers/MFG":  ["mizuho", "mizuho financial", "mfg"],
     "tickers/GRAB": ["grab", "grabfin", "grabfood", "grabcar", "grabmart"],
     "tickers/SE":   ["sea limited", "shopee", "garena", "seamoney", "sea ltd"],
     "tickers/FUTU": ["futu", "moomoo"],
@@ -364,6 +503,7 @@ RSS_MATCH_TERMS: dict[str, list[str]] = {
     "sectors/uranium-miners": ["uranium", "nuclear", "reactor", "cameco", "kazatomprom", "yellowcake", "u3o8", "ura"],
     "sectors/japan-banks": ["boj", "bank of japan", "megabank", "mufg", "smfg", "mizuho", "jgb", "japan bank"],
     "sectors/korea-memory": ["samsung", "sk hynix", "hbm", "dram", "nand", "memory", "semiconductor", "chip", "fab", "cxmt", "micron"],
+    "markets/korea": ["korea", "kospi", "kosdaq", "won", "krw", "ewy", "samsung", "sk hynix", "value-up"],
 }
 
 X_ACCOUNTS: dict[str, list[str]] = {

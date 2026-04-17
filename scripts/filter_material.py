@@ -41,6 +41,22 @@ PORTFOLIO_CONTEXT_PATH = WORKSPACE_ROOT / "PORTFOLIO_CONTEXT.md"
 # Tickers that attract broad macro noise — extra specificity rules injected into Pass 1.
 # Add entries here when a ticker routinely gets macro articles via loose KPI node linkage.
 TICKER_SPECIFICITY_HINTS: dict[str, str] = {
+    "tickers/HSBC": (
+        "HSBC-specific: Only include articles about HSBC Holdings, Hang Seng Bank integration, Hong Kong wealth, "
+        "UK ring-fenced banking, capital return/buybacks, Asian commercial banking, or regulations directly "
+        "targeting HSBC's footprint. Exclude generic UK bank commentary, broad Asia macro, or China property "
+        "stories unless HSBC, Hang Seng, or HSBC-specific credit exposure is directly discussed."
+    ),
+    "tickers/MUFG": (
+        "MUFG-specific: Only include articles about Mitsubishi UFJ, Morgan Stanley stake economics, Japanese megabank "
+        "deposit beta, BOJ normalization, domestic lending spreads, or MUFG-specific capital return / fee businesses. "
+        "Exclude generic Japan market moves unless MUFG or Japanese megabank earnings drivers are explicitly discussed."
+    ),
+    "tickers/MFG": (
+        "MIZUHO-specific: Only include articles about Mizuho Financial Group, Japan megabank rate sensitivity, advisory / "
+        "wholesale banking, securities integration, or Mizuho-specific capital return and profitability drivers. Exclude "
+        "generic Japan market commentary unless Mizuho or Japanese megabank earnings drivers are explicitly discussed."
+    ),
     "tickers/FUTU": (
         "FUTU-specific: Only include articles about Futu Holdings, moomoo, Chinese retail brokerage, "
         "Hong Kong/US trading volumes, China capital markets regulation, or competing brokers "
@@ -109,7 +125,10 @@ def _extract_name_context(portfolio_text: str, name: str, coverage_key: str) -> 
     # Extract "What Matters by Sector" for relevant sector
     sector_map = {
         "tickers/JPM": "Japan banks",  # not really, but JPM is US financials
+        "tickers/HSBC": "UK/Asia banks",
         "tickers/8316": "Japan banks",
+        "tickers/MUFG": "Japan banks",
+        "tickers/MFG": "Japan banks",
         "tickers/1299": "Insurance",
         "tickers/STAN": "UK/Asia banks",
         "tickers/GRAB": "SE Asia",

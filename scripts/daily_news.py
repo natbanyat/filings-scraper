@@ -41,7 +41,7 @@ log = setup_logging("daily_news")
 # ── Imports ───────────────────────────────────────────────────────────────────
 from config import (
     COVERAGE, COVERAGE_ROOT, CLOSE_WINDOWS, SEARCH_QUERIES, X_ACCOUNTS,
-    TICKER_META, YAHOO_SYMBOLS, RSS_FEEDS, RSS_MATCH_TERMS,
+    TICKER_META, YAHOO_SYMBOLS, RSS_FEEDS, RSS_MATCH_TERMS, WATCHLIST_ITEMS,
 )
 from fetch_news import (
     fetch_news, fetch_finnhub_news, fetch_x_mentions,
@@ -58,6 +58,7 @@ from inbox_writer import write_daily_inbox_item
 CHANNEL_MAP_PATH  = Path(__file__).parent / "channel_map.json"
 EVENTS_DIR        = Path(__file__).resolve().parent.parent / "events" / "ticker_news"
 UPDATE_FLAGS_DIR  = Path(__file__).resolve().parent.parent / "events" / "pending_updates"
+WATCHLIST_DIR     = Path(__file__).resolve().parent.parent / "coverage" / "watchlist"
 
 
 # ── Coverage update flag writer ───────────────────────────────────────────────
@@ -292,6 +293,14 @@ def run(dry_run: bool = False) -> None:
     if len(window_results) >= 3:
         _detect_cross_coverage(window_results, close_window, channel_map, dry_run)
 
+    # ── Inbox-only watchlist monitor ─────────────────────────────────────
+    _run_watchlist_monitor(
+        close_window=close_window,
+        dry_run=dry_run,
+        macro_context=macro_context,
+        portfolio_text=portfolio_text,
+    )
+
     log.info("Run complete.")
 
 
@@ -453,6 +462,119 @@ def _fetch_and_pass1(
         "macro_context": macro_context,
         "portfolio_text": portfolio_text,
     }
+
+
+def _watchlist_article_matches(article: dict, match_terms: list[str]) -> bool:
+    haystack = " ".join(
+        str(article.get(field, ""))
+        for field in ("title", "description", "body", "source")
+    ).lower()
+    return any(term.lower() in haystack for term in match_terms)
+
+
+def _run_watchlist_monitor(
+    close_window: str,
+    dry_run: bool,
+    macro_context: str = "",
+    portfolio_text: str = "",
+) -> None:
+    items = [
+        (item_id, meta)
+        for item_id, meta in WATCHLIST_ITEMS.items()
+        if meta.get("close") == close_window
+    ]
+    if not items:
+        return
+
+    WATCHLIST_DIR.mkdir(parents=True, exist_ok=True)
+
+    for item_id, meta in items:
+        name = meta.get("name", item_id)
+        ticker = meta.get("ticker", item_id)
+        state_key = f"watchlist/{item_id}"
+        inbox_key = f"tickers/{ticker}"
+        coverage_path = WATCHLIST_DIR / item_id
+        coverage_path.mkdir(parents=True, exist_ok=True)
+
+        log.info("── %s [Watchlist] ──────────────────────────────────", ticker)
+
+        if not dry_run and posted_today(state_key):
+            log.info("%s: watchlist already processed today — skipping", ticker)
+            continue
+
+        try:
+            articles = fetch_news(meta["query"], count=12)
+            articles = deduplicate(articles)
+            articles = deduplicate_similar(articles)
+            articles = filter_stale(articles)
+            articles = enrich_article_bodies(articles)
+            articles = [a for a in articles if _watchlist_article_matches(a, meta.get("match_terms", []))]
+
+            if not articles:
+                log.info("%s: no watchlist articles matched", ticker)
+                continue
+
+            if not dry_run:
+                articles = filter_unseen(articles, state_key)
+                if not articles:
+                    log.info("%s: all watchlist articles already seen — skipping", ticker)
+                    continue
+
+            material = pass_one(
+                articles,
+                coverage_path,
+                coverage_key=state_key,
+                name=name,
+                macro_context=macro_context,
+                portfolio_text=portfolio_text,
+            )
+            log.info("%s: Watchlist Pass 1 → %d material", ticker, len(material))
+            if not material:
+                continue
+
+            analyzed_bundle = pass_two(
+                material,
+                coverage_path,
+                name,
+                coverage_key=state_key,
+                macro_context=macro_context,
+                portfolio_text=portfolio_text,
+            )
+            brief = analyzed_bundle.get("brief", {})
+            analyzed = analyzed_bundle.get("articles", [])
+            log.info("%s: Watchlist Pass 2 → %d analyzed", ticker, len(analyzed))
+
+            if _is_unavailable_brief(brief):
+                log.warning("%s: watchlist brief unavailable after retries — suppressing inbox note", ticker)
+                continue
+
+            if dry_run:
+                log.info("%s [DRY RUN] watchlist headline: %s", ticker, brief.get("headline", ""))
+                continue
+
+            write_daily_inbox_item(
+                inbox_key,
+                name,
+                brief,
+                analyzed,
+                source_label="OpenClaw watchlist note",
+                item_type="note",
+            )
+
+            watchpoints = [w for w in brief.get("watchpoints", []) if isinstance(w, str) and w.strip()]
+            if watchpoints:
+                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                source_headline = brief.get("headline", "")
+                if isinstance(source_headline, list):
+                    source_headline = " | ".join(str(x).strip() for x in source_headline if str(x).strip())
+                store_watchpoints(state_key, watchpoints, today, str(source_headline))
+
+            mark_seen(analyzed, state_key)
+            mark_posted(state_key)
+            log.info("%s: watchlist inbox note written", ticker)
+
+        except Exception as exc:
+            log.error("%s: watchlist monitor failed — %s", ticker, exc, exc_info=True)
 
 
 def _macro_dedup_material(phase1_results: list[dict]) -> int:
