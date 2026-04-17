@@ -383,7 +383,7 @@ TICKER_META: dict[str, dict] = {
     },
     "tickers/STAN": {
         "sec_cik":  None,          # LSE-listed; does not file with SEC
-        "ir_page":  "https://www.sc.com/en/investors/results-and-reports/",
+        "ir_page":  "https://www.sc.com/en/investors/financial-results/",
         "av_symbol": None,
         "finnhub_symbol": None,    # LSE-listed; not on Finnhub
     },
