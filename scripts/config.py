@@ -63,12 +63,12 @@ COVERAGE = {
     "tickers/MMYT": {"channel": "mmyt",  "category": "TICKERS", "close": "us"},
 
     # ── Tickers: Asia Japan close ─────────────────────────────────────────────
-    "tickers/MUFG": {"channel": "mufg",  "category": "TICKERS", "close": "asia_japan"},
-    "tickers/MFG":  {"channel": "mfg",   "category": "TICKERS", "close": "asia_japan"},
+    "tickers/MUFG": {"channel": "8316",  "category": "TICKERS", "close": "asia_japan"},
+    "tickers/MFG":  {"channel": "8316",  "category": "TICKERS", "close": "asia_japan"},
     "tickers/8316": {"channel": "8316",  "category": "TICKERS", "close": "asia_japan"},
 
     # ── Tickers: Asia HK close ────────────────────────────────────────────────
-    "tickers/HSBC": {"channel": "hsbc",  "category": "TICKERS", "close": "asia_hk"},
+    "tickers/HSBC": {"channel": "stan",  "category": "TICKERS", "close": "asia_hk"},
     "tickers/1299": {"channel": "1299",  "category": "TICKERS", "close": "asia_hk"},
 
     # ── Sectors: US close ─────────────────────────────────────────────────────
