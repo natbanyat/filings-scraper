@@ -126,9 +126,26 @@ def _clean_article_url(article: dict) -> tuple[str, str]:
     return source or "source", url or "#"
 
 
-def _split_bullets(text: str) -> list[str]:
-    """Split a bullet-list string into individual bullet strings (stripped)."""
-    lines = text.strip().split("\n")
+def _normalize_text(value) -> str:
+    """Normalize model output into a display-safe string."""
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        parts = [str(item).strip() for item in value if str(item).strip()]
+        return "\n".join(parts)
+    return str(value).strip()
+
+
+def _split_bullets(text) -> list[str]:
+    """Split a bullet-list string or list into individual bullet strings."""
+    if isinstance(text, list):
+        return [str(item).strip() for item in text if str(item).strip()]
+
+    normalized = _normalize_text(text)
+    if not normalized:
+        return []
+
+    lines = normalized.split("\n")
     bullets: list[str] = []
     for line in lines:
         line = line.strip()
@@ -149,7 +166,7 @@ def build_embed(name: str, brief: dict, analyzed_articles: list[dict], close_win
     emoji  = DIRECTION_EMOJI.get(direction, "🟠")
 
     title = f"{emoji} {name.upper()} — Daily Briefing"
-    description = brief.get("headline", f"{len(analyzed_articles)} material item(s) flagged")
+    description = _normalize_text(brief.get("headline")) or f"{len(analyzed_articles)} material item(s) flagged"
     n_dev = len(analyzed_articles)
     footer_parts = ["investing-agent", f"{n_dev} development{'s' if n_dev != 1 else ''}"]
     if close_window:
@@ -165,11 +182,11 @@ def build_embed(name: str, brief: dict, analyzed_articles: list[dict], close_win
     fields = []
 
     # Build summary fields — "What Matters Now" is split into per-bullet fields (max 3)
-    what_changed = brief.get("what_changed", "")
+    what_changed = _normalize_text(brief.get("what_changed"))
     wc_bullets = _split_bullets(what_changed)[:3] if what_changed else []
 
     base_summary_fields: list[tuple[str, str]] = [
-        ("Thesis / Answer", brief.get("thesis_line", "")),
+        ("Thesis / Answer", _normalize_text(brief.get("thesis_line"))),
     ]
     if len(wc_bullets) > 1:
         for bullet in wc_bullets:
@@ -177,7 +194,7 @@ def build_embed(name: str, brief: dict, analyzed_articles: list[dict], close_win
     elif what_changed:
         base_summary_fields.append(("What Matters Now", what_changed))
 
-    base_summary_fields.append(("Key Debate", brief.get("key_debate", "")))
+    base_summary_fields.append(("Key Debate", _normalize_text(brief.get("key_debate"))))
 
     watchpoints = [w for w in brief.get("watchpoints", []) if isinstance(w, str) and w.strip()]
     if watchpoints:

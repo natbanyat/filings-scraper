@@ -9,6 +9,15 @@ from pathlib import Path
 
 WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
 COVERAGE_ROOT = WORKSPACE_ROOT / "coverage"
+INBOX_DIR = Path("/mnt/c/Users/natba/OneDrive/@ Cowork/investing/inbox")
+
+# Inbox handoff uses portfolio-facing primary tickers where a coverage item is
+# represented by an ETF or sector alias rather than a single company ticker.
+INBOX_PRIMARY_TICKER_OVERRIDES: dict[str, str] = {
+    "sectors/gold-miners": "GDX",
+    "sectors/uranium-miners": "URA",
+    "markets/korea": "EWY",
+}
 
 # Coverage files evolved over time. Tickers use the canonical filenames while
 # older sector/market folders still use kpis.md / watchlist.md.

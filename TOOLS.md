@@ -108,18 +108,20 @@ Filename format:
 Required front matter:
 ```yaml
 ---
-type: [news | research | transcript | filing | commentary | data]
+type: [commentary | research | note]
 ticker: [PRIMARY_TICKER or "SECTOR" or "MACRO"]
 tickers_mentioned: [TICKER1, TICKER2, ...]
 source: [publication name]
-source_url: [URL or "N/A"]
 date: [YYYY-MM-DD of source material]
-processed_date: [YYYY-MM-DD today]
 priority: [high | medium | low]
 tags: [comma-separated keywords]
 status: inbox
 ---
 ```
+
+Delivery status is logged in the producing script logs, especially:
+- `logs/daily_news.log`
+- `logs/macro_close.log`
 
 Priority rules:
 - high: earnings surprise, guidance change, M&A, regulatory shift, or anything that directly challenges or confirms a thesis

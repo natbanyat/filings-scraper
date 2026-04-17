@@ -53,6 +53,7 @@ from filter_material import pass_one, pass_two
 from post_discord import build_embed, send_embed, send_text, post_run_summary
 from cache import filter_unseen, mark_seen, posted_today, mark_posted, store_watchpoints
 from event_memory import index_event
+from inbox_writer import write_daily_inbox_item
 
 CHANNEL_MAP_PATH  = Path(__file__).parent / "channel_map.json"
 EVENTS_DIR        = Path(__file__).resolve().parent.parent / "events" / "ticker_news"
@@ -568,13 +569,21 @@ def _pass2_and_output(
     if not dry_run:
         _append_update_log(coverage_key, name, brief, analyzed)
 
-    # Step 4c: Store watchpoints from the brief
+    # Step 4c: Write external inbox handoff before Discord posting so Cowork
+    # ingestion still works even if downstream posting/rendering fails.
+    if not dry_run:
+        try:
+            write_daily_inbox_item(coverage_key, name, brief, analyzed)
+        except Exception as exc:
+            log.error("%s: inbox write failed — %s", name, exc, exc_info=True)
+
+    # Step 4d: Store watchpoints from the brief
     watchpoints = [w for w in brief.get("watchpoints", []) if isinstance(w, str) and w.strip()]
     if watchpoints and not dry_run:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         store_watchpoints(coverage_key, watchpoints, today, brief.get("headline", ""))
 
-    # Step 4d: Index event in long-term BM25 memory (always, including dry-run)
+    # Step 4e: Index event in long-term BM25 memory (always, including dry-run)
     try:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         kpi_nodes = ", ".join(a.get("kpi_node", "") for a in analyzed if a.get("kpi_node"))
