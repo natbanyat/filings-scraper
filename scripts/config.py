@@ -245,6 +245,37 @@ PREFERRED_SOURCES = [
     "barrons.com",
 ]
 
+# Trusted sources can pass the credibility gate even if they are not top-tier.
+# Keep this list conservative. Unknown domains should not dominate the pipeline.
+TRUSTED_SOURCES = PREFERRED_SOURCES + [
+    "channelnewsasia.com",
+    "businesstimes.com.sg",
+    "asia.nikkei.com",
+    "theglobeandmail.com",
+    "financialpost.com",
+    "economictimes.indiatimes.com",
+    "businesstoday.in",
+    "business-standard.com",
+    "thehindubusinessline.com",
+    "en.yna.co.kr",
+    "en.sedaily.com",
+    "koreaherald.com",
+    "koreajoongangdaily.joins.com",
+    "kedglobal.com",
+    "digitimes.com",
+    "skift.com",
+    "theasianbanker.com",
+    "sec.gov",
+    "hkexnews.hk",
+    "jpx.co.jp",
+    "boj.or.jp",
+    "federalreserve.gov",
+    "ecb.europa.eu",
+    "cmegroup.com",
+    "theice.com",
+    "tmx.com",
+]
+
 # ── Blocked sources ───────────────────────────────────────────────────────────
 # Low-quality aggregators, copy sites, and opinion mills.
 # Articles from these are dropped before any LLM call.
@@ -272,14 +303,26 @@ BLOCKED_SOURCES = [
     "ad-hoc-news.de",               # German press release aggregator, no editorial filter
     "newkerala.com",                 # low-authority Indian news aggregator
     "markets.financialcontent.com",  # content syndication platform
+    "marketscreener.com",            # quote/PR/secondary aggregation
     "parameter.io",                  # unknown-provenance rewrites
     "bestmediainfo.com",            # Indian media industry, not financial news
     "worldecomag.com",              # unverified financial content site
     "analyticsinsight.net",         # tech content farm, republishes/embellishes
     "travelbizmonitor.com",         # low-quality trade aggregator
+    "stocktitan.net",               # alert/aggregation wrapper
+    "fxstreet.com",                 # market commentary, weak for thesis-linked news
+    "heygotrade.com",               # low-authority market content site
+    "bitcoinworld.co.in",           # crypto content farm
+    "bloomingbit.io",               # crypto-focused Korean site
+    "insidentity.com",              # low-authority insurance content site
+    "defenseworld.net",             # holdings/position-change spam
+    "wral.com",                     # local TV news, weak financial relevance
+    "news.futunn.com",              # broker content portal / secondary aggregation
+    "cryptonews.net",               # low-authority crypto news site
+    "substack.com",                 # generic newsletter host; allow explicit exceptions only
     "rscapital.substack.com",       # retail investor Substack, no institutional credibility
     "manilatimes.net",              # low-quality syndicated business wire / low signal for this pipeline
-    "indiatimes.com",               # broad liveblogs / low signal for institutional market work
+    "timesofindia.indiatimes.com",  # broad liveblogs / low signal for institutional market work
 ]
 
 # ── Filter context size limits ────────────────────────────────────────────────

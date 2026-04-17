@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 import requests
-from config import PREFERRED_SOURCES, BLOCKED_SOURCES
+from config import PREFERRED_SOURCES, TRUSTED_SOURCES, BLOCKED_SOURCES
 from utils import retry
 
 log = logging.getLogger(__name__)
@@ -42,6 +42,78 @@ LOW_SIGNAL_TITLE_PATTERNS = [
 
 def _is_low_signal_title(title: str) -> bool:
     return any(pattern.search(title) for pattern in LOW_SIGNAL_TITLE_PATTERNS)
+
+
+def _normalize_source(source: str) -> str:
+    src = (source or "").strip().lower()
+    if src.startswith("www."):
+        src = src[4:]
+    return src
+
+
+def _source_matches(source: str, pattern: str) -> bool:
+    """Match source names robustly across raw publisher names and hostnames."""
+    src = _normalize_source(source)
+    pat = _normalize_source(pattern)
+    if not src or not pat:
+        return False
+    if src == pat or src.endswith(f".{pat}"):
+        return True
+    src_base = src.split(".")[0]
+    pat_base = pat.split(".")[0]
+    return src == pat_base or pat == src_base
+
+
+def _matches_any_source(source: str, patterns: list[str]) -> bool:
+    return any(_source_matches(source, pattern) for pattern in patterns)
+
+
+def _is_blocked_source(source: str) -> bool:
+    return _matches_any_source(source, BLOCKED_SOURCES)
+
+
+def _is_trusted_source(source: str) -> bool:
+    return _matches_any_source(source, TRUSTED_SOURCES)
+
+
+def _source_rank(article: dict) -> int:
+    src = article.get("source", "")
+    for i, preferred in enumerate(PREFERRED_SOURCES):
+        if _source_matches(src, preferred):
+            return i
+    return len(PREFERRED_SOURCES)
+
+
+def _apply_source_quality_gate(
+    articles: list[dict],
+    *,
+    min_trusted: int = 2,
+    fallback_if_some_trusted: int = 1,
+    fallback_if_none_trusted: int = 2,
+) -> list[dict]:
+    """
+    Prefer trusted publishers. Unknown domains should not dominate the feed.
+
+    If we already have enough trusted coverage, drop untrusted domains entirely.
+    If we have only sparse trusted coverage, allow a very small fallback tail.
+    """
+    trusted = [a for a in articles if _is_trusted_source(a.get("source", ""))]
+    untrusted = [a for a in articles if not _is_trusted_source(a.get("source", ""))]
+
+    if len(trusted) >= min_trusted:
+        kept = trusted
+    elif trusted:
+        kept = trusted + sorted(untrusted, key=_source_rank)[:fallback_if_some_trusted]
+    else:
+        kept = sorted(untrusted, key=_source_rank)[:fallback_if_none_trusted]
+
+    dropped = len(articles) - len(kept)
+    if dropped > 0:
+        log.info(
+            "Source-quality gate: kept %d/%d article(s) (%d trusted, %d dropped as low-cred fallback)",
+            len(kept), len(articles), len(trusted), dropped,
+        )
+    return kept
 
 
 @retry(max_attempts=3, backoff=2.0, exceptions=(requests.RequestException,))
@@ -86,7 +158,7 @@ def fetch_news(query: str, count: int = 20, freshness: str = "pd") -> list[dict]
     ]
 
     # Drop blocked sources, obvious ownership-churn headlines, and articles with no description.
-    blocked = {a["url"] for a in articles if any(s in a["source"] for s in BLOCKED_SOURCES)}
+    blocked = {a["url"] for a in articles if _is_blocked_source(a["source"])}
     if blocked:
         log.debug("Blocked %d article(s) from low-quality sources", len(blocked))
     low_signal = {a["url"] for a in articles if _is_low_signal_title(a["title"])}
@@ -99,15 +171,7 @@ def fetch_news(query: str, count: int = 20, freshness: str = "pd") -> list[dict]
         and a["description"]
     ]
 
-    # Rank by source quality: preferred sources ordered by their position in PREFERRED_SOURCES
-    # (earlier = higher priority). Unrecognised sources go last.
-    def _source_rank(article: dict) -> int:
-        src = article["source"]
-        for i, preferred in enumerate(PREFERRED_SOURCES):
-            if preferred in src:
-                return i
-        return len(PREFERRED_SOURCES)  # unranked goes after all preferred
-
+    articles = _apply_source_quality_gate(articles)
     result = sorted(articles, key=_source_rank)
     log.debug("Brave returned %d articles (after block/sort) for query: %s",
               len(result), query[:60])
@@ -148,16 +212,19 @@ def fetch_finnhub_news(symbol: str, days_back: int = 2) -> list[dict]:
         # Extract hostname from URL to match Brave's source format,
         # so PREFERRED_SOURCES / BLOCKED_SOURCES matching works unchanged.
         hostname = urlparse(r["url"]).hostname or ""
+        source = hostname
+        if not source or _source_matches(source, "finnhub.io"):
+            source = r.get("source", "") or hostname
         articles.append({
             "title": r.get("headline", "").strip(),
             "url": r["url"],
             "description": r.get("summary", "").strip(),
-            "source": hostname,
+            "source": source,
             "age": r.get("datetime", ""),
         })
 
     # Apply the same blocked-source and low-signal filters as Brave results
-    blocked = {a["url"] for a in articles if any(s in a["source"] for s in BLOCKED_SOURCES)}
+    blocked = {a["url"] for a in articles if _is_blocked_source(a["source"])}
     low_signal = {a["url"] for a in articles if _is_low_signal_title(a["title"])}
     articles = [
         a for a in articles
@@ -166,14 +233,7 @@ def fetch_finnhub_news(symbol: str, days_back: int = 2) -> list[dict]:
         and a["description"]
     ]
 
-    # Rank by source quality (same logic as Brave results)
-    def _source_rank(article: dict) -> int:
-        src = article["source"]
-        for i, preferred in enumerate(PREFERRED_SOURCES):
-            if preferred in src:
-                return i
-        return len(PREFERRED_SOURCES)
-
+    articles = _apply_source_quality_gate(articles)
     result = sorted(articles, key=_source_rank)
     log.debug("Finnhub returned %d articles for %s", len(result), symbol)
     return result
@@ -264,17 +324,9 @@ def _title_overlap(a: frozenset, b: frozenset) -> float:
     return len(a & b) / min(len(a), len(b))
 
 
-def _source_rank(article: dict) -> int:
-    src = article.get("source", "")
-    for i, preferred in enumerate(PREFERRED_SOURCES):
-        if preferred in src:
-            return i
-    return len(PREFERRED_SOURCES)
-
-
 def _source_domain(article: dict) -> str:
     """Extract the root domain from an article's source field."""
-    return article.get("source", "").lower().strip()
+    return _normalize_source(article.get("source", ""))
 
 
 def deduplicate_similar(articles: list[dict], threshold: float = 0.5) -> list[dict]:
@@ -556,7 +608,7 @@ def fetch_rss_news(
                 url = entry.get("link", "")
                 hostname = urlparse(url).hostname or ""
                 # Skip blocked sources even from RSS
-                if any(s in hostname for s in BLOCKED_SOURCES):
+                if _is_blocked_source(hostname):
                     continue
 
                 title = entry.get("title", "").strip()
@@ -581,8 +633,9 @@ def fetch_rss_news(
             log.warning("RSS fetch failed for %s: %s", feed_url, exc)
             continue
 
+    articles = _apply_source_quality_gate(articles)
     log.debug("RSS returned %d articles from %d feed(s)", len(articles), len(feeds))
-    return articles
+    return sorted(articles, key=_source_rank)
 
 
 # ── Price / volume context (yfinance) ────────────────────────────────────────
