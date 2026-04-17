@@ -44,6 +44,11 @@ Current sources:
 - `research/architecture/official-source-site-learnings.md`
   - first live report for STAN, HSBC, JPM, AIA, and GOOG
 
+- `scripts/official_doc_corpus.py` and `council_ui/official_docs_server.py`
+  - add a local corpus manager plus browser UI
+  - store downloaded files in the OneDrive-backed context folder with per-company / per-doc-type organization
+  - track runs and documents in SQLite for incremental follow-up
+
 ## Why this helps
 The current news pipeline is still vulnerable to weak publishers and same-story rewrites.
 An official-doc layer gives us a cleaner base for:

@@ -10,6 +10,8 @@ from pathlib import Path
 WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
 COVERAGE_ROOT = WORKSPACE_ROOT / "coverage"
 INBOX_DIR = Path("/mnt/c/Users/natba/OneDrive/@ Cowork/investing/inbox")
+OFFICIAL_DOC_CORPUS_DIR = Path("/mnt/c/Users/natba/OneDrive/@ Cowork/openclaw-investing-context")
+OFFICIAL_DOC_CORPUS_WINDOWS_DIR = r"C:\Users\natba\OneDrive\@ Cowork\openclaw-investing-context"
 
 # Inbox handoff uses portfolio-facing primary tickers where a coverage item is
 # represented by an ETF or sector alias rather than a single company ticker.
