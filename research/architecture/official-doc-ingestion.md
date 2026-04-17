@@ -26,6 +26,24 @@ Current sources:
 1. SEC EDGAR recent filings for covered SEC filers
 2. Company IR pages, same-host links only
 
+## Adapter layer and live probe harness
+- `scripts/official_source_adapters.py`
+  - adds a metadata-driven adapter interface for SEC, LSE / RNS, HKEXnews, and TSE / TDnet
+  - SEC currently has a live document fetch path
+  - LSE / HKEX / TSE currently expose endpoint probes plus URL/storage templates for the next parser pass
+
+- `scripts/official_docs_probe.py`
+  - probes configured company websites plus exchange endpoints
+  - fetches reachable official docs for first-look setup
+  - writes a persistent site-learning report capturing:
+    - naming conventions
+    - storage paths
+    - access constraints
+    - periodic document families observed in the wild
+
+- `research/architecture/official-source-site-learnings.md`
+  - first live report for STAN, HSBC, JPM, AIA, and GOOG
+
 ## Why this helps
 The current news pipeline is still vulnerable to weak publishers and same-story rewrites.
 An official-doc layer gives us a cleaner base for:

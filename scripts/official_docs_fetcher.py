@@ -57,8 +57,9 @@ IR_DOC_KEYWORDS = {
     "presentation": ["presentation", "slide deck", "investor presentation"],
     "results": ["quarterly results", "earnings", "results release", "financial results", "interim results"],
     "annual_report": ["annual report", "20-f", "10-k", "integrated report"],
+    "data_pack": ["data pack", "datapack", "excel", "xlsx", "xls"],
     "webcast": ["webcast"],
-    "investor_day": ["investor day", "capital markets day"],
+    "investor_day": ["investor day", "capital markets day", "agm"],
 }
 DATE_PATTERNS = [
     re.compile(r"(20\d{2}-\d{2}-\d{2})"),
@@ -118,6 +119,8 @@ def _classify_doc_type(text: str, form_type: str | None = None) -> str:
         if form == "10-Q":
             return "quarterly_filing"
         if form in {"8-K", "6-K"}:
+            if "data pack" in hay or ".xlsx" in hay or ".xls" in hay:
+                return "data_pack"
             if "presentation" in hay:
                 return "presentation"
             if "transcript" in hay or "conference call" in hay:
@@ -152,7 +155,7 @@ def _is_ir_doc_candidate(link_text: str, href: str, context: str) -> bool:
 
     has_keyword = any(keyword in f"{link_text_clean} {href_lower} {context_lower}" for keyword in keywords)
     is_pdf = href_lower.endswith(".pdf")
-    has_doc_like_href = is_pdf or any(token in href_lower for token in ["results", "earnings", "presentation", "transcript", "report", "webcast"])
+    has_doc_like_href = is_pdf or href_lower.endswith((".xlsx", ".xls")) or any(token in href_lower for token in ["results", "earnings", "presentation", "transcript", "report", "webcast", "datapack", "data-pack", "agm"])
     has_period_marker = bool(QUARTER_OR_YEAR_RE.search(f"{link_text_clean} {context_lower} {href_lower}"))
 
     if is_pdf:
@@ -258,8 +261,11 @@ def fetch_sec_recent_documents(
                 chosen_url,
                 headers=HEADERS_EDGAR,
             )
-            if "pdf" in content_type or final_url.lower().endswith(".pdf"):
+            lower_url = final_url.lower()
+            if "pdf" in content_type or lower_url.endswith(".pdf"):
                 text = _extract_pdf_text(data)
+            elif lower_url.endswith((".xlsx", ".xls")) or any(token in (content_type or "").lower() for token in ["spreadsheet", "excel", "officedocument.spreadsheetml"]):
+                text = f"{form_type} {chosen_name} {final_url}"
             else:
                 text = _clean_html_text(data.decode(encoding, errors="replace"))
         except Exception as exc:

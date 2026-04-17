@@ -364,80 +364,142 @@ TWITTER_SIGNAL_LOOKBACK_HOURS = 10  # fetch tweets from last N hours (fallback i
 
 TICKER_META: dict[str, dict] = {
     "tickers/JPM":  {
+        "company_name": "JPMorgan Chase & Co.",
         "sec_cik":  "0000019617",
         "ir_page":  "https://www.jpmorganchase.com/ir/quarterly-earnings",
+        "website_probe_urls": [
+            "https://www.jpmorganchase.com/ir/quarterly-earnings",
+            "https://www.jpmorganchase.com/ir/annual-report",
+        ],
+        "exchange_adapter": "sec",
+        "exchange_symbol": "JPM",
         "av_symbol": "JPM",
         "finnhub_symbol": "JPM",
     },
     "tickers/HSBC": {
+        "company_name": "HSBC Holdings plc",
         "sec_cik":  None,
         "ir_page":  "https://www.hsbc.com/investors/results-and-announcements",
+        "website_probe_urls": [
+            "https://www.hsbc.com/investors/results-and-announcements",
+            "https://www.hsbc.com/investors/results-and-announcements/annual-report",
+        ],
+        "exchange_adapter": "hkex",
+        "exchange_code": "0005",
+        "exchange_symbol": "0005",
         "av_symbol": None,
         "finnhub_symbol": "HSBC",
     },
     "tickers/TMX":  {
+        "company_name": "TMX Group Limited",
         "sec_cik":  None,          # TSX-listed (X.TO); files on SEDAR, not SEC
         "ir_page":  "https://www.tmx.com/investor-relations",
         "av_symbol": None,
         "finnhub_symbol": None,    # TSX-listed; thin Finnhub coverage
     },
     "tickers/STAN": {
+        "company_name": "Standard Chartered PLC",
         "sec_cik":  None,          # LSE-listed; does not file with SEC
         "ir_page":  "https://www.sc.com/en/investors/financial-results/",
+        "website_probe_urls": [
+            "https://www.sc.com/en/investors/financial-results/",
+        ],
+        "exchange_adapter": "lse",
+        "exchange_symbol": "STAN",
+        "exchange_slug": "standard-chartered-plc",
         "av_symbol": None,
         "finnhub_symbol": None,    # LSE-listed; not on Finnhub
     },
     "tickers/MUFG": {
+        "company_name": "Mitsubishi UFJ Financial Group, Inc.",
         "sec_cik":  None,
         "ir_page":  "https://www.mufg.jp/english/ir/financialinfo/index.html",
+        "exchange_adapter": "tse",
+        "exchange_code": "8306",
+        "exchange_symbol": "8306",
         "av_symbol": None,
         "finnhub_symbol": "MUFG",
     },
     "tickers/MFG": {
+        "company_name": "Mizuho Financial Group, Inc.",
         "sec_cik":  None,
         "ir_page":  "https://www.mizuhogroup.com/investors",
+        "exchange_adapter": "tse",
+        "exchange_code": "8411",
+        "exchange_symbol": "8411",
         "av_symbol": None,
         "finnhub_symbol": "MFG",
     },
     "tickers/GRAB": {
+        "company_name": "Grab Holdings Limited",
         "sec_cik":  "0001833928",
         "ir_page":  "https://investors.grab.com/financial-information/quarterly-results",
+        "exchange_adapter": "sec",
+        "exchange_symbol": "GRAB",
         "av_symbol": "GRAB",
         "finnhub_symbol": "GRAB",
     },
     "tickers/SE":   {
+        "company_name": "Sea Limited",
         "sec_cik":  "0001726445",
         "ir_page":  "https://www.sea.com/investors/financials/results",
+        "exchange_adapter": "sec",
+        "exchange_symbol": "SE",
         "av_symbol": "SE",
         "finnhub_symbol": "SE",
     },
     "tickers/FUTU": {
+        "company_name": "Futu Holdings Limited",
         "sec_cik":  "0001780731",
         "ir_page":  "https://ir.futuholdings.com/financial-information/quarterly-results",
+        "exchange_adapter": "sec",
+        "exchange_symbol": "FUTU",
         "av_symbol": "FUTU",
         "finnhub_symbol": "FUTU",
     },
     "tickers/GOOG": {
+        "company_name": "Alphabet Inc.",
         "sec_cik":  "0001652044",
         "ir_page":  "https://abc.xyz/investor/",
+        "website_probe_urls": [
+            "https://abc.xyz/investor/",
+            "https://abc.xyz/investor/Earnings/default.aspx",
+        ],
+        "exchange_adapter": "sec",
+        "exchange_symbol": "GOOG",
         "av_symbol": "GOOG",
         "finnhub_symbol": "GOOGL",
     },
     "tickers/MMYT": {
+        "company_name": "MakeMyTrip Limited",
         "sec_cik":  "0001403708",
         "ir_page":  "https://investors.makemytrip.com/financial-information/quarterly-results",
+        "exchange_adapter": "sec",
+        "exchange_symbol": "MMYT",
         "av_symbol": "MMYT",
         "finnhub_symbol": "MMYT",
     },
     "tickers/8316": {
+        "company_name": "Sumitomo Mitsui Financial Group, Inc.",
         "sec_cik":  "0001023428",   # SMFG files 20-F with SEC
         "ir_page":  "https://www.smfg.co.jp/english/investor/financial/",
+        "exchange_adapter": "tse",
+        "exchange_code": "8316",
+        "exchange_symbol": "8316",
         "av_symbol": None,           # Not on Alpha Vantage
         "finnhub_symbol": "SMFG",   # US-listed ADR
     },
     "tickers/1299": {
+        "company_name": "AIA Group Limited",
         "sec_cik":  None,           # HKEx-listed; does not file with SEC
-        "ir_page":  "https://www.aia.com/en/investor-relations/results-and-reports",
+        "ir_page":  "https://www.aia.com/en/investor-relations/overview/results-presentations",
+        "website_probe_urls": [
+            "https://www.aia.com/en/investor-relations/overview",
+            "https://www.aia.com/en/investor-relations/overview/results-presentations",
+        ],
+        "exchange_adapter": "hkex",
+        "exchange_code": "1299",
+        "exchange_symbol": "1299",
         "av_symbol": None,
         "finnhub_symbol": None,    # HKEx-listed; not on Finnhub
     },
