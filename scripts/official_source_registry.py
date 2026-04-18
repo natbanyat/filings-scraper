@@ -250,7 +250,7 @@ def _build_entries_from_ticker_meta(ticker_meta: dict[str, dict]) -> list[Source
                 owner="lse_adapter",
                 enabled=True,
                 notes=[
-                    "LSE/RNS company pages are JS-rendered; download_mode=browser for future full fetcher.",
+                    "LSE/RNS company pages are JS-rendered; use browser mode for rendered pages, but direct RNS PDF asset URLs can still download over HTTP once discovered.",
                     "IR archive is currently the practical source for results, presentations, and data packs.",
                 ],
             ))

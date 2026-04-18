@@ -58,6 +58,11 @@ def corpus_root() -> Path:
     return OFFICIAL_DOC_CORPUS_DIR
 
 
+def corpus_python() -> str:
+    venv_python = WORKSPACE_ROOT / ".venv" / "bin" / "python"
+    return str(venv_python if venv_python.exists() else Path(sys.executable))
+
+
 def _registry_as_list() -> list[dict]:
     try:
         from official_source_registry import get_registry
@@ -95,7 +100,7 @@ def summary_payload() -> dict:
             "Use exchange/filer adapters first when available, then company IR archives.",
             "Per-file downloads retry with alternate request headers and a queryless URL variant when needed.",
             "SEC is live for filing retrieval; LSE, HKEX, and TSE currently function as probe/discovery layers plus IR fallback.",
-            "Sources with download_mode=browser can use the Playwright lane when the dependency is installed; HTTP-first download remains the default for standard sources.",
+            "Sources with download_mode=browser can use the Playwright lane when the dependency is installed; direct asset URLs like PDFs still prefer HTTP when they are already addressable.",
         ],
     }
 
@@ -189,10 +194,14 @@ async def index(_: web.Request) -> web.Response:
   <!-- Parse / Delta stats -->
   <div class="card">
     <h2>Pipeline stats</h2>
-    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px;">
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px;">
       <div>
         <h3 class="small muted" style="margin-bottom:6px;">Parse status</h3>
         <div id="stat-parse" class="stat-grid"></div>
+      </div>
+      <div>
+        <h3 class="small muted" style="margin-bottom:6px;">Derived artifacts</h3>
+        <div id="stat-derived" class="stat-grid"></div>
       </div>
       <div>
         <h3 class="small muted" style="margin-bottom:6px;">Delta state</h3>
@@ -234,6 +243,23 @@ async def index(_: web.Request) -> web.Response:
         </div>
       </form>
       <div id="run-result" class="small spaced"></div>
+
+      <h3 class="spaced">Backfill existing parses</h3>
+      <p class="small">Queue parse jobs for already-downloaded corpus files, including older docs missing derived artifacts.</p>
+      <form id="parse-form" class="grid">
+        <div class="form-grid">
+          <label><span class="small muted">Known company</span><select id="parse_company_key" name="company_key"></select></label>
+          <label><span class="small muted">Limit</span><input name="limit" value="25"></label>
+        </div>
+        <label class="small muted" style="display:flex;gap:8px;align-items:center;">
+          <input type="checkbox" id="missing-derived" name="missing_derived" checked style="width:auto;">
+          Include already-parsed docs whose derived artifact is missing
+        </label>
+        <div style="display:flex;gap:12px;">
+          <button type="submit">Run parse backfill</button>
+        </div>
+      </form>
+      <div id="parse-result" class="small spaced"></div>
     </div>
 
     <!-- Fallback policy + known companies -->
@@ -283,7 +309,7 @@ async def index(_: web.Request) -> web.Response:
       <thead>
         <tr>
           <th>Company</th><th>Family</th><th>Date</th><th>Title</th>
-          <th>File</th><th>Delta</th><th>Parse</th><th>Source</th>
+          <th>Artifacts</th><th>Delta</th><th>Parse</th><th>Source</th>
         </tr>
       </thead>
       <tbody id="documents-body"></tbody>
@@ -347,15 +373,22 @@ function renderSummary(data) {
   // Stats
   const ps = data.parse_stats || {};
   renderStatGrid('stat-parse', ps.parse_status, {parsed:'status-parsed',parse_failed:'status-parse_failed',unparsed:'status-unparsed',not_applicable:'status-not_applicable'});
+  renderStatGrid('stat-derived', ps.derived_artifacts, {available:'status-completed',missing:'status-unparsed'});
   renderStatGrid('stat-delta', ps.delta_state, {new:'delta-new',updated:'delta-updated',unchanged:'delta-unchanged',duplicate:'delta-duplicate',failed_download:'delta-failed_download',failed_parse:'delta-failed_parse'});
   renderStatGrid('stat-jobs', ps.jobs, {pending:'status-pending',running:'status-running',completed:'status-completed',failed:'status-failed'});
 
-  // Coverage dropdown
+  // Coverage dropdowns
+  const coverageOptions = data.known_companies || [];
   const coverage = document.getElementById('coverage_key');
+  const parseCoverage = document.getElementById('parse_company_key');
   coverage.innerHTML = '';
+  parseCoverage.innerHTML = '';
   coverage.append(el('option', {value:''}, 'Ad hoc / custom company'));
-  data.known_companies.forEach(item => {
-    coverage.append(el('option', {value:item.coverage_key}, `${item.coverage_key} — ${item.company_name}`));
+  parseCoverage.append(el('option', {value:''}, 'All companies in corpus'));
+  coverageOptions.forEach(item => {
+    const label = `${item.coverage_key} — ${item.company_name}`;
+    coverage.append(el('option', {value:item.coverage_key}, label));
+    parseCoverage.append(el('option', {value:item.coverage_key}, label));
   });
 
   // Fallback list
@@ -406,6 +439,8 @@ function renderSummary(data) {
   (data.recent_documents || []).forEach(doc => {
     const tr = el('tr');
     const href = doc.relative_path ? `/files/${encodeURI(doc.relative_path)}` : (doc.final_url||doc.source_url||'#');
+    const parseHref = doc.parse_artifact_relative_path ? `/files/${encodeURI(doc.parse_artifact_relative_path)}` : '';
+    const derivedHref = doc.derived_artifact_relative_path ? `/files/${encodeURI(doc.derived_artifact_relative_path)}` : '';
     const fname = doc.filename || 'missing';
     const delta = doc.delta_state || '';
     const parse = doc.parse_status || '';
@@ -414,9 +449,13 @@ function renderSummary(data) {
       <td>${doc.doc_family||doc.doc_type||'other'}</td>
       <td>${doc.published_at||'undated'}</td>
       <td>${doc.title||'Untitled'}</td>
-      <td><a href="${href}" target="_blank">${fname}</a></td>
+      <td class="small">
+        <a href="${href}" target="_blank">raw: ${fname}</a><br>
+        ${doc.parse_artifact_available ? `<a href="${parseHref}" target="_blank">parse.json</a>` : '<span class="muted">parse.json —</span>'}<br>
+        ${doc.derived_artifact_available ? `<a href="${derivedHref}" target="_blank">derived.json</a>` : '<span class="muted">derived.json —</span>'}
+      </td>
       <td><span class="pill delta-${delta}">${delta||'—'}</span></td>
-      <td><span class="pill status-${parse}">${parse||'—'}</span></td>
+      <td><span class="pill status-${parse}">${parse||'—'}</span><br><span class="small muted">${doc.latest_parser_name||'—'} ${doc.latest_parsed_at ? '· '+formatDate(doc.latest_parsed_at) : ''}</span></td>
       <td class="small">${doc.source||'—'}</td>
     `;
     docsBody.append(tr);
@@ -514,6 +553,30 @@ document.getElementById('run-form').addEventListener('submit', async (event) => 
   }
 });
 
+document.getElementById('parse-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const form = new FormData(event.target);
+  const payload = {
+    process: true,
+    limit: Number(form.get('limit') || 25),
+    missing_derived: document.getElementById('missing-derived').checked,
+  };
+  if (form.get('company_key')) payload.company_key = form.get('company_key');
+  const resultBox = document.getElementById('parse-result');
+  resultBox.textContent = 'Dispatching parse backfill...';
+  try {
+    const data = await fetchJSON('/api/parse-backfill', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload),
+    });
+    resultBox.textContent = `Queued parse backfill ${data.dispatch_id} (${data.limit} doc cap${data.company_key ? `, ${data.company_key}` : ''}).`;
+    refresh();
+  } catch (err) {
+    resultBox.textContent = `Error: ${err.message}`;
+  }
+});
+
 refresh();
 loadRegistry();
 setInterval(refresh, 5000);
@@ -567,7 +630,7 @@ async def api_run(request: web.Request) -> web.Response:
         return json_response({"error": "coverage_key or company_name is required"}, status=400)
 
     command = [
-        sys.executable,
+        corpus_python(),
         str(SCRIPTS_DIR / "official_doc_corpus.py"),
         "run",
         "--root", str(corpus_root()),
@@ -614,6 +677,44 @@ async def api_run(request: web.Request) -> web.Response:
     })
 
 
+async def api_parse_backfill(request: web.Request) -> web.Response:
+    payload = await request.json()
+    command = [
+        corpus_python(),
+        str(SCRIPTS_DIR / "official_doc_corpus.py"),
+        "parse",
+        "--root", str(corpus_root()),
+        "--backfill-existing",
+        "--limit", str(int(payload.get("limit") or 25)),
+    ]
+
+    company_key = payload.get("company_key") or None
+    if company_key:
+        command.extend(["--company-key", str(company_key)])
+    if payload.get("missing_derived", True):
+        command.append("--missing-derived")
+    if payload.get("process", True):
+        command.append("--process")
+
+    dispatch_id = str(uuid.uuid4())
+    process = subprocess.Popen(
+        command,
+        cwd=str(WORKSPACE_ROOT),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+    return json_response({
+        "ok": True,
+        "pid": process.pid,
+        "dispatch_id": dispatch_id,
+        "company_key": company_key,
+        "limit": int(payload.get("limit") or 25),
+        "message": "Parse backfill dispatched. Refresh to monitor parse jobs and artifact links.",
+    })
+
+
 async def file_handler(request: web.Request) -> web.StreamResponse:
     tail = request.match_info.get("tail", "")
     root = corpus_root().resolve()
@@ -640,6 +741,7 @@ def build_app() -> web.Application:
         web.get("/api/parse-records", api_parse_records),
         web.get("/api/registry", api_registry),
         web.post("/api/run", api_run),
+        web.post("/api/parse-backfill", api_parse_backfill),
         web.get(r"/files/{tail:.*}", file_handler),
     ])
     return app

@@ -110,6 +110,7 @@ PARSEABLE_CONTENT_TYPES = {
     "application/xhtml+xml",
     "text/plain",
 }
+DIRECT_HTTP_EXTENSIONS = {".pdf", ".xlsx", ".xls", ".html", ".htm", ".txt", ".json"}
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -476,6 +477,33 @@ def row_to_dict(row: sqlite3.Row | None) -> dict | None:
     return dict(row) if row is not None else None
 
 
+def _path_exists(path_value: str | None) -> bool:
+    return bool(path_value and Path(path_value).exists())
+
+
+def _path_relative_to_root(path_value: str | None, root: Path) -> str | None:
+    if not path_value:
+        return None
+    try:
+        resolved = Path(path_value).resolve()
+        root_resolved = root.resolve()
+        return str(resolved.relative_to(root_resolved))
+    except Exception:
+        return None
+
+
+def _attach_artifact_fields(item: dict, root: Path) -> dict:
+    parse_path = item.get("parse_artifact_path") or item.get("artifact_path")
+    derived_path = item.get("derived_artifact_path")
+    item["parse_artifact_path"] = parse_path
+    item["parse_artifact_relative_path"] = _path_relative_to_root(parse_path, root)
+    item["parse_artifact_available"] = _path_exists(parse_path)
+    item["derived_artifact_path"] = derived_path
+    item["derived_artifact_relative_path"] = _path_relative_to_root(derived_path, root)
+    item["derived_artifact_available"] = _path_exists(derived_path)
+    return item
+
+
 # ---------------------------------------------------------------------------
 # Query helpers
 # ---------------------------------------------------------------------------
@@ -491,16 +519,38 @@ def list_runs(root: Path, *, limit: int = 50) -> list[dict]:
 
 
 def list_documents(root: Path, *, company_key: str | None = None, limit: int = 500) -> list[dict]:
-    query = "SELECT * FROM documents"
+    query = """
+        SELECT
+          d.*,
+          p.parse_id AS latest_parse_id,
+          p.parsed_at AS latest_parsed_at,
+          p.parser_name AS latest_parser_name,
+          p.text_chars AS latest_text_chars,
+          p.page_count AS latest_page_count,
+          p.table_count AS latest_table_count,
+          p.quality_flags AS latest_quality_flags,
+          p.error AS latest_parse_error,
+          p.artifact_path AS parse_artifact_path,
+          p.derived_artifact_path AS derived_artifact_path
+        FROM documents d
+        LEFT JOIN document_parses p
+          ON p.parse_id = (
+            SELECT p2.parse_id
+            FROM document_parses p2
+            WHERE p2.doc_id = d.doc_id
+            ORDER BY p2.parsed_at DESC, p2.rowid DESC
+            LIMIT 1
+          )
+    """
     params: list[Any] = []
     if company_key:
-        query += " WHERE company_key = ?"
+        query += " WHERE d.company_key = ?"
         params.append(company_key)
-    query += " ORDER BY COALESCE(published_at, last_seen_at, downloaded_at) DESC LIMIT ?"
+    query += " ORDER BY COALESCE(d.published_at, d.last_seen_at, d.downloaded_at) DESC LIMIT ?"
     params.append(limit)
     with open_db(root) as conn:
         rows = conn.execute(query, tuple(params)).fetchall()
-    return [dict(row) for row in rows]
+    return [_attach_artifact_fields(dict(row), root) for row in rows]
 
 
 def list_companies(root: Path) -> list[dict]:
@@ -548,7 +598,7 @@ def list_parse_records(root: Path, *, doc_id: str | None = None, limit: int = 20
     params.append(limit)
     with open_db(root) as conn:
         rows = conn.execute(query, tuple(params)).fetchall()
-    return [dict(row) for row in rows]
+    return [_attach_artifact_fields(dict(row), root) for row in rows]
 
 
 def list_jobs(root: Path, *, status: str | None = None, job_type: str | None = None, limit: int = 100) -> list[dict]:
@@ -582,9 +632,31 @@ def get_parse_stats(root: Path) -> dict:
         job_rows = conn.execute(
             "SELECT status, COUNT(*) AS cnt FROM jobs GROUP BY status"
         ).fetchall()
+        derived_rows = conn.execute(
+            """
+            SELECT
+              CASE
+                WHEN p.derived_artifact_path IS NOT NULL AND p.derived_artifact_path != '' THEN 'available'
+                ELSE 'missing'
+              END AS derived_state,
+              COUNT(*) AS cnt
+            FROM documents d
+            LEFT JOIN document_parses p
+              ON p.parse_id = (
+                SELECT p2.parse_id
+                FROM document_parses p2
+                WHERE p2.doc_id = d.doc_id
+                ORDER BY p2.parsed_at DESC, p2.rowid DESC
+                LIMIT 1
+              )
+            WHERE d.parse_status = 'parsed'
+            GROUP BY derived_state
+            """
+        ).fetchall()
     return {
         "parse_status": {row["parse_status"] or "null": row["cnt"] for row in rows},
         "delta_state": {row["delta_state"] or "null": row["cnt"] for row in delta_rows},
+        "derived_artifacts": {row["derived_state"]: row["cnt"] for row in derived_rows},
         "jobs": {row["status"]: row["cnt"] for row in job_rows},
     }
 
@@ -879,6 +951,21 @@ def resolve_source_entry_for_document(doc: dict, source_entries: list[Any]) -> A
     return None
 
 
+def effective_download_mode_for_document(doc: dict, source_entry: Any | None) -> str:
+    mode = getattr(source_entry, "download_mode", "http") if source_entry else "http"
+    if mode != "browser":
+        return mode
+
+    parsed = urlparse(doc.get("url") or "")
+    hostname = (parsed.hostname or "").lower()
+    suffix = Path(parsed.path).suffix.lower()
+    if suffix in DIRECT_HTTP_EXTENSIONS:
+        return "http"
+    if hostname.startswith("rns-pdf."):
+        return "http"
+    return "browser"
+
+
 def _content_type_from_name(name: str) -> str:
     suffix = Path(name or "").suffix.lower()
     mapping = {
@@ -1134,7 +1221,7 @@ def save_site_learning(root: Path, spec: CompanySpec, documents: list[dict]) -> 
         "Primary source order is exchange/filer adapter first when available, then company IR archive.",
         "Download fallbacks per file try direct URL first, then alternate request headers, then a queryless URL variant when the source URL includes query parameters.",
         "Current limitation: LSE, HKEX, and TSE adapters are still probe/discovery layers, so historical corpus builds for those names rely mostly on IR archives today.",
-        "Sources configured as download_mode=browser can use the Playwright lane when Playwright + Chromium are installed; otherwise they still record browser_required for auditing.",
+        "Sources configured as download_mode=browser can use the Playwright lane when Playwright + Chromium are installed; direct asset URLs such as PDFs still prefer HTTP when they are already addressable.",
     ]
 
     payload = {
@@ -1391,7 +1478,7 @@ def is_parseable_document(*, filename: str | None, absolute_path: str | None, co
     return (content_type or "").lower() in PARSEABLE_CONTENT_TYPES
 
 
-def ensure_parse_job_for_document(conn: sqlite3.Connection, doc: dict) -> str | None:
+def ensure_parse_job_for_document(conn: sqlite3.Connection, doc: dict, *, force: bool = False) -> str | None:
     if not is_parseable_document(
         filename=doc.get("filename"),
         absolute_path=doc.get("absolute_path"),
@@ -1399,7 +1486,7 @@ def ensure_parse_job_for_document(conn: sqlite3.Connection, doc: dict) -> str | 
     ):
         return None
     parse_status = doc.get("parse_status") or "unparsed"
-    if parse_status == "parsed":
+    if parse_status == "parsed" and not force:
         return None
     existing_job = conn.execute(
         "SELECT job_id FROM jobs WHERE doc_id = ? AND job_type = 'parse' AND status IN ('pending', 'running') LIMIT 1",
@@ -1484,6 +1571,10 @@ def run_parse_job(
     doc = dict(row)
     abs_path = doc.get("absolute_path") or ""
     content_type = doc.get("content_type") or ""
+    company_folder = doc.get("company_folder") or ""
+    artifact_dir = root / company_folder / META_DIRNAME / PARSES_DIRNAME
+    artifact_path = artifact_dir / f"{doc_id}.json"
+    previous_result = load_parse_artifact(artifact_path)
 
     if not abs_path or not Path(abs_path).exists():
         conn.execute(
@@ -1496,18 +1587,30 @@ def run_parse_job(
     try:
         result = parse_document(Path(abs_path), content_type)
     except Exception as exc:
-        conn.execute(
-            "UPDATE jobs SET status = 'failed', finished_at = ?, error = ?, failure_type = 'transient' WHERE job_id = ?",
-            (utc_now_iso(), str(exc), job_id),
+        if previous_result and previous_result.ok:
+            log.warning("Reusing prior parse artifact for %s after parser exception: %s", doc_id, exc)
+            result = previous_result
+            reused_previous_parse = True
+        else:
+            conn.execute(
+                "UPDATE jobs SET status = 'failed', finished_at = ?, error = ?, failure_type = 'transient' WHERE job_id = ?",
+                (utc_now_iso(), str(exc), job_id),
+            )
+            conn.commit()
+            return
+    else:
+        reused_previous_parse = False
+
+    if previous_result and previous_result.ok and not result.ok:
+        log.warning(
+            "Reusing prior parse artifact for %s after parser failure: %s",
+            doc_id,
+            result.error or "unknown parse error",
         )
-        conn.commit()
-        return
+        result = previous_result
+        reused_previous_parse = True
 
     # Save artifact
-    company_folder = doc.get("company_folder") or ""
-    artifact_dir = root / company_folder / META_DIRNAME / PARSES_DIRNAME
-    artifact_path = artifact_dir / f"{doc_id}.json"
-    previous_result = load_parse_artifact(artifact_path)
     try:
         save_parse_artifact(result, artifact_path)
     except Exception as exc:
@@ -1550,7 +1653,13 @@ def run_parse_job(
         )
     else:
         conn.execute(
-            "UPDATE documents SET parse_status = ?, parse_quality_flags = ? WHERE doc_id = ?",
+            """
+            UPDATE documents
+            SET parse_status = ?,
+                parse_quality_flags = ?,
+                delta_state = CASE WHEN delta_state = 'failed_parse' THEN 'unchanged' ELSE delta_state END
+            WHERE doc_id = ?
+            """,
             (parse_status, quality_flags_json, doc_id),
         )
     conn.commit()
@@ -1560,6 +1669,7 @@ def run_parse_job(
         "parse_id": parse_id,
         "parser_name": result.parser_name,
         "ok": result.ok,
+        "reused_previous_parse": reused_previous_parse,
         "text_chars": len(result.text),
         "page_count": result.page_count,
         "table_count": result.table_count,
@@ -1588,6 +1698,145 @@ def process_pending_parse_jobs(root: Path, *, limit: int = 50) -> dict:
                 failed += 1
                 log.warning("Parse job %s failed: %s", job["job_id"], exc)
     return {"completed": completed, "failed": failed, "processed": len(jobs)}
+
+
+def list_parse_backfill_candidates(
+    root: Path,
+    *,
+    company_key: str | None = None,
+    limit: int = 100,
+    parse_statuses: list[str] | None = None,
+    include_missing_derived: bool = True,
+) -> list[dict]:
+    statuses = list(dict.fromkeys(parse_statuses or ["unparsed", "parse_failed"]))
+    with open_db(root) as conn:
+        query = """
+            SELECT
+              d.*,
+              p.parse_id AS latest_parse_id,
+              p.parsed_at AS latest_parsed_at,
+              p.parser_name AS latest_parser_name,
+              p.artifact_path AS parse_artifact_path,
+              p.derived_artifact_path AS derived_artifact_path
+            FROM documents d
+            LEFT JOIN document_parses p
+              ON p.parse_id = (
+                SELECT p2.parse_id
+                FROM document_parses p2
+                WHERE p2.doc_id = d.doc_id
+                ORDER BY p2.parsed_at DESC, p2.rowid DESC
+                LIMIT 1
+              )
+        """
+        conditions: list[str] = ["d.absolute_path IS NOT NULL", "d.absolute_path != ''"]
+        params: list[Any] = []
+        if company_key:
+            conditions.append("d.company_key = ?")
+            params.append(company_key)
+        status_conditions: list[str] = []
+        if statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            status_conditions.append(f"d.parse_status IN ({placeholders})")
+            params.extend(statuses)
+        if include_missing_derived:
+            status_conditions.append(
+                "(d.parse_status = 'parsed' AND (p.derived_artifact_path IS NULL OR p.derived_artifact_path = ''))"
+            )
+        if status_conditions:
+            conditions.append("(" + " OR ".join(status_conditions) + ")")
+        query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY COALESCE(d.published_at, d.last_seen_at, d.downloaded_at) DESC"
+        rows = conn.execute(query, tuple(params)).fetchall()
+
+    candidates: list[dict] = []
+    for row in rows:
+        item = _attach_artifact_fields(dict(row), root)
+        if not is_parseable_document(
+            filename=item.get("filename"),
+            absolute_path=item.get("absolute_path"),
+            content_type=item.get("content_type"),
+        ):
+            continue
+        if not _path_exists(item.get("absolute_path")):
+            continue
+        item["backfill_reason"] = "missing_derived" if (
+            item.get("parse_status") == "parsed" and not item.get("derived_artifact_available")
+        ) else (item.get("parse_status") or "unparsed")
+        candidates.append(item)
+        if len(candidates) >= limit:
+            break
+    return candidates
+
+
+def queue_parse_backfill_jobs(
+    root: Path,
+    *,
+    company_key: str | None = None,
+    limit: int = 100,
+    parse_statuses: list[str] | None = None,
+    include_missing_derived: bool = True,
+    process_now: bool = False,
+) -> dict:
+    candidates = list_parse_backfill_candidates(
+        root,
+        company_key=company_key,
+        limit=limit,
+        parse_statuses=parse_statuses,
+        include_missing_derived=include_missing_derived,
+    )
+    queued_job_ids: list[str] = []
+    existing_job_ids: list[str] = []
+
+    with open_db(root) as conn:
+        for doc in candidates:
+            existing_job = conn.execute(
+                "SELECT job_id FROM jobs WHERE doc_id = ? AND job_type = 'parse' AND status IN ('pending', 'running') LIMIT 1",
+                (doc["doc_id"],),
+            ).fetchone()
+            if existing_job:
+                existing_job_ids.append(existing_job["job_id"])
+                continue
+            force = doc.get("parse_status") == "parsed"
+            job_id = ensure_parse_job_for_document(conn, doc, force=force)
+            if job_id:
+                queued_job_ids.append(job_id)
+
+    processed_summary: dict[str, Any] | None = None
+    if process_now and queued_job_ids:
+        processed_summary = {"completed": 0, "failed": 0, "processed": len(queued_job_ids)}
+        with open_db(root) as conn:
+            for job_id in queued_job_ids:
+                job = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+                if not job:
+                    continue
+                try:
+                    run_parse_job(conn, dict(job), root=root)
+                    processed_summary["completed"] += 1
+                except Exception as exc:
+                    processed_summary["failed"] += 1
+                    log.warning("Backfill parse job %s failed: %s", job_id, exc)
+
+    return {
+        "company_key": company_key,
+        "candidate_count": len(candidates),
+        "queued_count": len(queued_job_ids),
+        "existing_job_count": len(existing_job_ids),
+        "queued_job_ids": queued_job_ids,
+        "existing_job_ids": existing_job_ids,
+        "processed": processed_summary,
+        "candidates": [
+            {
+                "doc_id": item["doc_id"],
+                "company_key": item.get("company_key"),
+                "title": item.get("title"),
+                "filename": item.get("filename"),
+                "parse_status": item.get("parse_status"),
+                "backfill_reason": item.get("backfill_reason"),
+                "relative_path": item.get("relative_path"),
+            }
+            for item in candidates
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1623,7 +1872,7 @@ def run_scrape(
         source_entries = []
     browser_sources = {e.source_id for e in source_entries if e.download_mode == "browser"}
     if browser_sources:
-        log.info("Note: sources %s require browser automation (scaffolded, not yet active)", browser_sources)
+        log.info("Note: sources %s may require browser automation for rendered pages; direct document URLs still use HTTP when possible", browser_sources)
 
     discovered = downloaded = skipped = errors = 0
     documents: list[dict] = []
@@ -1645,7 +1894,7 @@ def run_scrape(
             has_conditional_validators = bool(existing_file_present and conditional_request_headers(existing))
 
             source_entry = resolve_source_entry_for_document(doc, source_entries)
-            doc_download_mode = getattr(source_entry, "download_mode", "http") if source_entry else "http"
+            doc_download_mode = effective_download_mode_for_document(doc, source_entry)
 
             # Legacy fast-path when we have a file but no validators to revalidate with.
             if existing_file_present and not has_conditional_validators:
@@ -1759,7 +2008,7 @@ def run_scrape(
                 update_run(conn, run_id, downloaded_count=downloaded)
 
             except BrowserFallbackRequired as exc:
-                log.info("Browser required for %s (not yet active; recording as browser_required)", exc.url)
+                log.info("Browser required for %s (recording as browser_required)", exc.url)
                 upsert_document(
                     conn,
                     spec=spec,
@@ -1875,6 +2124,17 @@ def parse_args() -> argparse.Namespace:
     parse_parser.add_argument("--root", type=Path, default=OFFICIAL_DOC_CORPUS_DIR)
     parse_parser.add_argument("--limit", type=int, default=50)
     parse_parser.add_argument("--doc-id", help="Parse a specific document by ID")
+    parse_parser.add_argument("--company-key", help="Limit parse backfill to one company")
+    parse_parser.add_argument(
+        "--status",
+        dest="parse_statuses",
+        action="append",
+        choices=["unparsed", "parse_failed", "parsed", "not_applicable"],
+        help="When using --backfill-existing, include documents with this parse status (repeatable)",
+    )
+    parse_parser.add_argument("--backfill-existing", action="store_true", help="Queue parse jobs for existing corpus files, not just newly downloaded docs")
+    parse_parser.add_argument("--missing-derived", action="store_true", help="When backfilling, also include parsed docs whose latest derived artifact is missing")
+    parse_parser.add_argument("--process", action="store_true", help="Process the queued backfill jobs immediately")
 
     # list-runs
     list_runs_parser = sub.add_parser("list-runs", help="List recent runs")
@@ -1957,6 +2217,16 @@ def main() -> None:
                     ).fetchone()
                 run_parse_job(conn, dict(job_row), root=args.root)
             print(f"Parsed document {args.doc_id}")
+        elif args.backfill_existing:
+            result = queue_parse_backfill_jobs(
+                args.root,
+                company_key=args.company_key,
+                limit=args.limit,
+                parse_statuses=args.parse_statuses,
+                include_missing_derived=args.missing_derived or not args.parse_statuses,
+                process_now=args.process,
+            )
+            print(json.dumps(result, indent=2, ensure_ascii=False))
         else:
             result = process_pending_parse_jobs(args.root, limit=args.limit)
             print(json.dumps(result, indent=2, ensure_ascii=False))
