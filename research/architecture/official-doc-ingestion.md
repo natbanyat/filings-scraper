@@ -108,13 +108,15 @@ The latest architecture review does not change the core direction. It sharpens i
 - HTTP-first discovery and download path
 - Browser automation only as a fallback for JS, auth, or click-download flows
 - Official docs as a higher-priority source bucket than general web/news fetches
+- Crawler-first, browser-second operating model
 
 ### Add next
 1. **Source registry separate from `TICKER_META`**
    - maintain explicit source records with seed URLs, allowed domains, crawl mode, download mode, parse profile, poll frequency, and owner
    - this should prevent crawler logic from spreading into one-off ticker metadata hacks
 2. **Manifest DB as the real system of record**
-   - extend corpus metadata to include response headers, content length, ETag, Last-Modified, parse status, and parse quality flags
+   - extend corpus metadata to include source URL, final URL, response headers, content length, ETag, Last-Modified, download status, parse status, and parse quality flags
+   - preserve raw originals in immutable storage and keep raw response artifacts where failure investigation matters
    - the raw file store remains immutable storage, but the manifest becomes the truth for tracking state
 3. **Parser / normalization workers**
    - PDFs: native extraction first, table extraction where possible, OCR only as fallback
@@ -128,6 +130,10 @@ The latest architecture review does not change the core direction. It sharpens i
 6. **Browser fallback lane, not browser-first architecture**
    - use Playwright only when direct HTTP fails or the site truly requires JS/session state
    - keep the easy 80% on the simple deterministic path
+7. **Scheduler / queue and operational guardrails**
+   - add an explicit job scheduler/queue instead of relying only on ad hoc subprocess launches
+   - enforce per-domain concurrency limits, retries with backoff, and clear transient vs permanent failure classes
+   - keep provenance, parser confidence, and policy notes per source, and never overwrite raw originals
 
 ### Framework choice
 - If the source mix stays mostly public, static, and Python-friendly, `Scrapy + HTTPX + Playwright fallback` is the clean low-complexity choice.
@@ -148,12 +154,21 @@ A daily pipeline should ideally work in this order:
 3. top-tier wires
 4. broader search only as a fallback
 
+Discovery should ideally work in this order:
+1. sitemap or robots-discovered sitemap
+2. known archive / library pages
+3. predictable listing pages
+4. internal JSON/XHR/API endpoints
+5. browser-rendered inspection
+6. site search only if necessary
+
 And the document pipeline should ideally work in this order:
 1. source registry
-2. HTTP-first discovery and download
-3. Playwright fallback only when needed
-4. manifest DB + immutable raw storage
-5. parser / normalization workers
-6. delta summaries and research-facing outputs
+2. scheduler / queue
+3. HTTP-first discovery and download
+4. Playwright fallback only when needed
+5. manifest DB + immutable raw storage
+6. parser / normalization workers
+7. delta summaries and research-facing outputs
 
 That should materially improve source quality, reduce false positives, and turn the corpus from a file cabinet into a usable research substrate.

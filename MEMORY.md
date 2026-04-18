@@ -68,7 +68,8 @@ Brave Search → dedup → cache filter → Pass 1 (Haiku) → Pass 2 (Sonnet, b
 
 ### Official-doc architecture direction
 - Keep the official-doc pipeline deterministic and HTTP-first; use OpenClaw as control plane and analyst layer, not as the transport engine.
-- Near-term priorities: explicit source registry, manifest DB as system of record, parser/normalization workers for PDF/XLSX, version/delta tracking, and Playwright as fallback only for JS/auth/click-download edge cases.
+- Near-term priorities: explicit source registry, manifest DB as system of record, parser/normalization workers for PDF/XLSX, version/delta tracking, an explicit scheduler/queue layer, and Playwright as fallback only for JS/auth/click-download edge cases.
+- Discovery priority should be sitemap/robots → known archive pages → predictable listings → internal JSON/XHR/API endpoints → browser inspection → site search last.
 - Framework default depends on site mix: prefer Scrapy + HTTPX + Playwright fallback for mostly public/Python-friendly sources, or Crawlee + HTTPX + Playwright fallback if the corpus becomes more JS-heavy or auth-heavy.
 
 ---
