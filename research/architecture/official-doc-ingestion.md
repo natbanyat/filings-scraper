@@ -140,12 +140,68 @@ The latest architecture review does not change the core direction. It sharpens i
 - If the source mix grows toward more JS-heavy or auth-heavy IR/document centers, `Crawlee + HTTPX + Playwright fallback` is the better long-run default.
 - Either way, the parser/storage/delta layers matter more than the crawler brand.
 
-## Limits of the first pass
-- IR date extraction is heuristic and will miss some page layouts
-- non-SEC exchange filings are not yet implemented
-- some IR sites will still require per-site tuning
-- PDFs are text-extracted only, with no table normalization yet
-- corpus incrementality is still mostly URL/path based, not full remote change detection
+## v2 implementation status (2026-04-18)
+
+All seven architecture items above are now implemented in code:
+
+1. **Source registry** (`scripts/official_source_registry.py`)
+   - `SourceEntry` dataclass with all required fields
+   - YAML backing at `scripts/official_source_registry.yaml`, auto-bootstrapped from TICKER_META
+   - 25 entries covering all tickers (SEC, LSE, HKEX, TSE, IR sources)
+   - `get_registry()` singleton, `for_coverage_key()`, `all_enabled()`
+
+2. **Manifest DB v2** (`scripts/official_doc_corpus.py`)
+   - `documents` table: added `content_length`, `etag`, `last_modified`, `first_seen_at`,
+     `download_status`, `parse_status`, `parse_quality_flags`, `delta_state`,
+     `failure_type`, `retry_count`, `retry_after`
+   - New `document_parses` table for parser outputs (parse_id, parser_name, text_chars,
+     page_count, table_count, quality_flags, artifact_path)
+   - New `jobs` table for background job queue (job_id, job_type, status,
+     company_key, doc_id, failure_type, retry_count)
+   - `_migrate_schema()` for backward-compatible upgrade of existing DBs
+   - `download_with_fallbacks()` now captures ETag, Last-Modified, Content-Length
+
+3. **Parser workers** (`scripts/official_doc_parsers.py`)
+   - `PDFParser`: pypdf native text + optional pdfplumber table extraction;
+     OCR-needed flag via text-density heuristic (`< 150 chars/page`)
+   - `XLSXParser`: openpyxl workbook metadata, per-sheet extraction, hidden/protected detection
+   - `parse_document(path, content_type)` dispatcher
+   - `save_parse_artifact()` / `load_parse_artifact()` for JSON artifact persistence
+   - Quality flags: `ocr_needed`, `low_text_density`, `tables_found`, `has_hidden_sheets`,
+     `has_protected_sheet`, `partial_text`, `empty_output`
+
+4. **Delta tracking** (`run_scrape()`, `compute_delta_state()`, `find_by_sha256()`)
+   - States: `new`, `unchanged`, `updated`, `duplicate`, `moved`, `failed_download`, `failed_parse`
+   - Hash-based: unchanged if SHA256 matches existing record; duplicate if SHA256 matches different URL
+   - `unchanged` docs skip re-download; `updated` docs re-save with new hash
+
+5. **Browser fallback scaffolding**
+   - `BrowserFallbackRequired` exception with `url` and `source_id` attributes
+   - `download_with_fallbacks(url, target_dir, download_mode=)` respects `download_mode=browser`
+   - LSE sources in registry get `download_mode=browser` (transparent, no active crawl yet)
+   - `browser_required` download_status recorded in manifest for auditing
+
+6. **UI** (`council_ui/official_docs_server.py`)
+   - `/api/registry` — full source registry as JSON
+   - `/api/jobs` — job queue with status/type filters
+   - `/api/parse-records` — document parse history
+   - `/api/summary` — now includes `parse_stats`, `recent_jobs`
+   - Dashboard: pipeline stats (parse_status, delta_state, job queue counts),
+     delta-state and parse-status columns in documents table, jobs card with tab filter,
+     source registry card, download_mode=browser highlighted in warn color
+
+7. **New CLI commands** (`official_doc_corpus.py`)
+   - `parse [--limit N] [--doc-id ID]` — run pending parse jobs
+   - `list-jobs [--status STATUS]` — view job queue
+   - `stats` — parse/delta/job aggregate counts
+   - `run --parse` — parse inline after scrape
+
+## Remaining limits
+- Non-SEC exchange filings (LSE, HKEX, TSE) still not fetched — probe/scaffold only
+- IR date extraction is heuristic and misses some page layouts
+- Browser automation backend (Playwright) not yet wired — `browser_required` is recorded but not actioned
+- Corpus incrementality for unchanged files is hash-based, not ETag/conditional-GET yet
+- AI-ready derived artifacts (chunks, delta summaries) not yet implemented
 
 ## Practical target state
 A daily pipeline should ideally work in this order:

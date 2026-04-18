@@ -19,14 +19,23 @@ Storage layout (default):
       _meta/
         site_learning.md
         site_learning.json
+        parses/
+          <doc_id>.json
 
-The retrieval policy is intentionally layered:
-  1. Exchange / filing adapter when available (SEC live today)
-  2. Company IR archive scraping
-  3. Download fallbacks per file URL (header and URL variants)
+Schema v2 changes (backward compatible):
+  documents table: added content_length, etag, last_modified, first_seen_at,
+                   download_status, parse_status, parse_quality_flags,
+                   delta_state, failure_type, retry_count, retry_after
+  New tables: document_parses, jobs
 
-LSE / HKEX / TSE are currently discovery/probe adapters rather than full filing
-backfills, so non-SEC names primarily rely on their IR archives for now.
+Delta states:
+  new              : first time we've seen this URL
+  unchanged        : same SHA256 as last download — file not re-saved
+  updated          : SHA256 changed — new version saved
+  duplicate        : same SHA256 as another document from same company
+  moved            : URL changed but title+date point to same document
+  failed_download  : all download attempts failed
+  failed_parse     : download succeeded but parser returned an error
 """
 
 from __future__ import annotations
@@ -60,6 +69,7 @@ log = setup_logging("official_doc_corpus")
 
 DB_FILENAME = "corpus.db"
 META_DIRNAME = "_meta"
+PARSES_DIRNAME = "parses"
 MAX_DOWNLOAD_BYTES = 75 * 1024 * 1024
 DEFAULT_INCREMENTAL_DAYS = 400
 DEFAULT_INCREMENTAL_MAX_DOCS = 25
@@ -90,6 +100,30 @@ CONTENT_TYPE_EXTENSIONS = {
     "application/vnd.ms-excel": ".xls",
 }
 
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
+
+
+class BrowserFallbackRequired(Exception):
+    """
+    Raised when a source is configured as download_mode=browser but the
+    browser automation backend is not available.
+
+    The caller should record download_status='browser_required' and
+    delta_state='failed_download' with failure_type='transient'.
+    """
+
+    def __init__(self, url: str, source_id: str | None = None) -> None:
+        self.url = url
+        self.source_id = source_id
+        super().__init__(f"browser required for {url}")
+
+
+# ---------------------------------------------------------------------------
+# Dataclasses
+# ---------------------------------------------------------------------------
+
 
 @dataclass
 class CompanySpec:
@@ -105,6 +139,11 @@ class CompanySpec:
     website_probe_urls: list[str] = field(default_factory=list)
     company_key: str | None = None
     company_folder: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
 
 
 def utc_now() -> datetime:
@@ -144,6 +183,11 @@ def db_path(root: Path) -> Path:
     return meta_dir / DB_FILENAME
 
 
+# ---------------------------------------------------------------------------
+# Database schema
+# ---------------------------------------------------------------------------
+
+
 def open_db(root: Path) -> sqlite3.Connection:
     path = db_path(root)
     conn = sqlite3.connect(path)
@@ -151,10 +195,12 @@ def open_db(root: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     ensure_schema(conn)
+    _migrate_schema(conn)
     return conn
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
+    """Create tables that didn't exist yet. Safe to call repeatedly."""
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS runs (
@@ -215,17 +261,89 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             metadata_json TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS document_parses (
+            parse_id TEXT PRIMARY KEY,
+            doc_id TEXT NOT NULL,
+            parsed_at TEXT NOT NULL,
+            parser_name TEXT NOT NULL,
+            parse_version INTEGER NOT NULL DEFAULT 1,
+            text_chars INTEGER,
+            page_count INTEGER,
+            table_count INTEGER,
+            quality_flags TEXT,
+            error TEXT,
+            artifact_path TEXT,
+            FOREIGN KEY (doc_id) REFERENCES documents(doc_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS jobs (
+            job_id TEXT PRIMARY KEY,
+            job_type TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            started_at TEXT,
+            finished_at TEXT,
+            company_key TEXT,
+            coverage_key TEXT,
+            doc_id TEXT,
+            params_json TEXT,
+            result_json TEXT,
+            error TEXT,
+            failure_type TEXT,
+            retry_count INTEGER DEFAULT 0,
+            retry_after TEXT
+        );
+
         CREATE INDEX IF NOT EXISTS idx_runs_company_created ON runs(company_key, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_docs_company_seen ON documents(company_key, last_seen_at DESC);
         CREATE INDEX IF NOT EXISTS idx_docs_family ON documents(company_key, doc_family, published_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_docs_sha256 ON documents(sha256);
+        CREATE INDEX IF NOT EXISTS idx_parses_doc ON document_parses(doc_id);
+        CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_jobs_company ON jobs(company_key, job_type, status);
         """
     )
     conn.commit()
 
 
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """
+    Add v2 columns to the documents table if they don't exist yet.
+    Safe to run against v1 databases.
+    """
+    cursor = conn.execute("PRAGMA table_info(documents)")
+    existing = {row[1] for row in cursor.fetchall()}
+
+    new_cols: list[tuple[str, str]] = [
+        ("content_length", "INTEGER"),
+        ("etag", "TEXT"),
+        ("last_modified", "TEXT"),
+        ("first_seen_at", "TEXT"),
+        ("download_status", "TEXT"),
+        ("parse_status", "TEXT"),
+        ("parse_quality_flags", "TEXT"),
+        ("delta_state", "TEXT"),
+        ("failure_type", "TEXT"),
+        ("retry_count", "INTEGER DEFAULT 0"),
+        ("retry_after", "TEXT"),
+    ]
+    for col_name, col_type in new_cols:
+        if col_name not in existing:
+            try:
+                conn.execute(f"ALTER TABLE documents ADD COLUMN {col_name} {col_type}")
+            except sqlite3.OperationalError as exc:
+                log.debug("Column migration skipped (%s): %s", col_name, exc)
+    conn.commit()
+
+
 def row_to_dict(row: sqlite3.Row | None) -> dict | None:
     return dict(row) if row is not None else None
+
+
+# ---------------------------------------------------------------------------
+# Query helpers
+# ---------------------------------------------------------------------------
 
 
 def list_runs(root: Path, *, limit: int = 50) -> list[dict]:
@@ -285,10 +403,66 @@ def list_companies(root: Path) -> list[dict]:
     return companies
 
 
+def list_parse_records(root: Path, *, doc_id: str | None = None, limit: int = 200) -> list[dict]:
+    query = "SELECT * FROM document_parses"
+    params: list[Any] = []
+    if doc_id:
+        query += " WHERE doc_id = ?"
+        params.append(doc_id)
+    query += " ORDER BY parsed_at DESC LIMIT ?"
+    params.append(limit)
+    with open_db(root) as conn:
+        rows = conn.execute(query, tuple(params)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def list_jobs(root: Path, *, status: str | None = None, job_type: str | None = None, limit: int = 100) -> list[dict]:
+    conditions: list[str] = []
+    params: list[Any] = []
+    if status:
+        conditions.append("status = ?")
+        params.append(status)
+    if job_type:
+        conditions.append("job_type = ?")
+        params.append(job_type)
+    where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+    params.append(limit)
+    with open_db(root) as conn:
+        rows = conn.execute(
+            f"SELECT * FROM jobs{where} ORDER BY created_at DESC LIMIT ?",
+            tuple(params),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_parse_stats(root: Path) -> dict:
+    """Return aggregate parse status counts."""
+    with open_db(root) as conn:
+        rows = conn.execute(
+            "SELECT parse_status, COUNT(*) AS cnt FROM documents GROUP BY parse_status"
+        ).fetchall()
+        delta_rows = conn.execute(
+            "SELECT delta_state, COUNT(*) AS cnt FROM documents GROUP BY delta_state"
+        ).fetchall()
+        job_rows = conn.execute(
+            "SELECT status, COUNT(*) AS cnt FROM jobs GROUP BY status"
+        ).fetchall()
+    return {
+        "parse_status": {row["parse_status"] or "null": row["cnt"] for row in rows},
+        "delta_state": {row["delta_state"] or "null": row["cnt"] for row in delta_rows},
+        "jobs": {row["status"]: row["cnt"] for row in job_rows},
+    }
+
+
 def get_run(root: Path, run_id: str) -> dict | None:
     with open_db(root) as conn:
         row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
     return row_to_dict(row)
+
+
+# ---------------------------------------------------------------------------
+# Company spec
+# ---------------------------------------------------------------------------
 
 
 def normalize_company_spec(
@@ -342,6 +516,11 @@ def normalize_company_spec(
     )
 
 
+# ---------------------------------------------------------------------------
+# Document classification
+# ---------------------------------------------------------------------------
+
+
 def family_for_document(doc: dict) -> str:
     text = " ".join(
         str(doc.get(key) or "")
@@ -386,6 +565,11 @@ def dedupe_documents(documents: list[dict]) -> list[dict]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Document collection
+# ---------------------------------------------------------------------------
+
+
 def collect_candidate_documents(spec: CompanySpec, *, mode: str, days_back: int, max_docs: int) -> list[dict]:
     docs: list[dict] = []
 
@@ -403,12 +587,66 @@ def collect_candidate_documents(spec: CompanySpec, *, mode: str, days_back: int,
     return docs
 
 
+# ---------------------------------------------------------------------------
+# DB lookups
+# ---------------------------------------------------------------------------
+
+
 def lookup_existing_document(conn: sqlite3.Connection, url: str) -> dict | None:
     row = conn.execute(
         "SELECT * FROM documents WHERE source_url = ? OR final_url = ? LIMIT 1",
         (url, url),
     ).fetchone()
     return row_to_dict(row)
+
+
+def find_by_sha256(conn: sqlite3.Connection, sha256: str, *, company_key: str) -> dict | None:
+    """Find an existing document with the same SHA256 hash for the same company."""
+    if not sha256:
+        return None
+    row = conn.execute(
+        "SELECT * FROM documents WHERE sha256 = ? AND company_key = ? LIMIT 1",
+        (sha256, company_key),
+    ).fetchone()
+    return row_to_dict(row)
+
+
+# ---------------------------------------------------------------------------
+# Delta state computation
+# ---------------------------------------------------------------------------
+
+
+def compute_delta_state(
+    *,
+    existing: dict | None,
+    new_sha256: str,
+    conn: sqlite3.Connection,
+    company_key: str,
+) -> str:
+    """
+    Determine the delta state for a newly downloaded document.
+
+    States:
+      new        : no existing record for this URL
+      unchanged  : same sha256 as the existing record
+      updated    : different sha256 — content changed
+      duplicate  : sha256 matches a *different* document in this company corpus
+    """
+    if existing is None:
+        # Check if it's a cross-URL duplicate within the same company
+        dupe = find_by_sha256(conn, new_sha256, company_key=company_key)
+        if dupe:
+            return "duplicate"
+        return "new"
+    existing_sha = existing.get("sha256") or ""
+    if existing_sha and existing_sha == new_sha256:
+        return "unchanged"
+    return "updated"
+
+
+# ---------------------------------------------------------------------------
+# Filename helpers
+# ---------------------------------------------------------------------------
 
 
 def content_extension(final_url: str, content_type: str, title: str) -> str:
@@ -445,6 +683,11 @@ def canonical_filename(doc: dict, basename: str) -> str:
     return sanitize_filename(f"{published}_{title}{suffix}")
 
 
+# ---------------------------------------------------------------------------
+# HTTP helpers
+# ---------------------------------------------------------------------------
+
+
 def prefer_edgar_headers(url: str) -> bool:
     host = (urlparse(url).hostname or "").lower()
     return host.endswith("sec.gov") or host.endswith("data.sec.gov")
@@ -470,7 +713,26 @@ def url_variants(url: str) -> list[str]:
     return variants
 
 
-def download_with_fallbacks(url: str, target_dir: Path) -> dict:
+def download_with_fallbacks(
+    url: str,
+    target_dir: Path,
+    *,
+    download_mode: str = "http",
+) -> dict:
+    """
+    Download a URL to a temp file in target_dir.
+
+    Returns a dict with:
+      temp_path, final_url, content_type, content_length, etag, last_modified,
+      size_bytes, sha256, attempts
+
+    Raises:
+      BrowserFallbackRequired  if download_mode is 'browser'
+      RuntimeError             if all HTTP attempts fail
+    """
+    if download_mode == "browser":
+        raise BrowserFallbackRequired(url)
+
     attempts: list[dict] = []
     last_error: str | None = None
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -483,6 +745,13 @@ def download_with_fallbacks(url: str, target_dir: Path) -> dict:
             try:
                 resp = requests.get(candidate_url, headers=headers, stream=True, timeout=30, allow_redirects=True)
                 resp.raise_for_status()
+
+                # Capture response metadata
+                etag = resp.headers.get("ETag") or resp.headers.get("etag")
+                last_modified = resp.headers.get("Last-Modified") or resp.headers.get("last-modified")
+                content_length_str = resp.headers.get("Content-Length") or resp.headers.get("content-length")
+                content_length: int | None = int(content_length_str) if content_length_str and content_length_str.isdigit() else None
+
                 total = 0
                 sha = hashlib.sha256()
                 with tempfile.NamedTemporaryFile(delete=False, dir=target_dir) as tmp:
@@ -495,15 +764,19 @@ def download_with_fallbacks(url: str, target_dir: Path) -> dict:
                             raise ValueError(f"download exceeded {MAX_DOWNLOAD_BYTES} bytes")
                         sha.update(chunk)
                         tmp.write(chunk)
-                result = {
+                return {
                     "temp_path": temp_path,
                     "final_url": resp.url,
                     "content_type": resp.headers.get("Content-Type", "").split(";")[0].strip().lower(),
+                    "content_length": content_length,
+                    "etag": etag,
+                    "last_modified": last_modified,
                     "size_bytes": total,
                     "sha256": sha.hexdigest(),
                     "attempts": attempts + [{"url": candidate_url, "headers": header_label, "status": resp.status_code, "result": "ok"}],
                 }
-                return result
+            except BrowserFallbackRequired:
+                raise
             except Exception as exc:
                 last_error = str(exc)
                 attempts.append({"url": candidate_url, "headers": header_label, "result": "error", "error": str(exc)})
@@ -514,6 +787,11 @@ def download_with_fallbacks(url: str, target_dir: Path) -> dict:
                     resp.close()
 
     raise RuntimeError(last_error or f"download failed for {url}")
+
+
+# ---------------------------------------------------------------------------
+# Site learning
+# ---------------------------------------------------------------------------
 
 
 def save_site_learning(root: Path, spec: CompanySpec, documents: list[dict]) -> None:
@@ -539,6 +817,7 @@ def save_site_learning(root: Path, spec: CompanySpec, documents: list[dict]) -> 
         "Primary source order is exchange/filer adapter first when available, then company IR archive.",
         "Download fallbacks per file try direct URL first, then alternate request headers, then a queryless URL variant when the source URL includes query parameters.",
         "Current limitation: LSE, HKEX, and TSE adapters are still probe/discovery layers, so historical corpus builds for those names rely mostly on IR archives today.",
+        "Sources configured as download_mode=browser are scaffolded but not yet fetched; set download_mode=http or mixed to enable HTTP-first download.",
     ]
 
     payload = {
@@ -579,6 +858,11 @@ def save_site_learning(root: Path, spec: CompanySpec, documents: list[dict]) -> 
         lines.append(f"- {note}")
     lines.append("")
     (meta_dir / "site_learning.md").write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Run management
+# ---------------------------------------------------------------------------
 
 
 def ensure_run(conn: sqlite3.Connection, spec: CompanySpec, *, run_id: str, mode: str, days_back: int, max_docs: int) -> None:
@@ -625,6 +909,11 @@ def update_run(conn: sqlite3.Connection, run_id: str, **fields: Any) -> None:
     conn.commit()
 
 
+# ---------------------------------------------------------------------------
+# Document upsert
+# ---------------------------------------------------------------------------
+
+
 def upsert_document(
     conn: sqlite3.Connection,
     *,
@@ -640,11 +929,27 @@ def upsert_document(
     filename: str,
     status: str,
     metadata: dict,
-) -> None:
+    # v2 fields
+    content_length: int | None = None,
+    etag: str | None = None,
+    last_modified: str | None = None,
+    download_status: str | None = None,
+    parse_status: str = "unparsed",
+    parse_quality_flags: list[str] | None = None,
+    delta_state: str | None = None,
+    failure_type: str | None = None,
+) -> str:
+    """Insert or update a document record. Returns the doc_id."""
     now = utc_now_iso()
     existing = lookup_existing_document(conn, doc.get("url") or final_url)
     payload = json.dumps(metadata, ensure_ascii=False)
     family = family_for_document(doc)
+    quality_flags_json = json.dumps(parse_quality_flags or [])
+
+    # Compute download_status from legacy status if not provided
+    if download_status is None:
+        download_status = status
+
     if existing:
         conn.execute(
             """
@@ -653,38 +958,28 @@ def upsert_document(
               final_url = ?, source = ?, origin = ?, form_type = ?, doc_type = ?, doc_family = ?,
               published_at = ?, title = ?, filename = ?, relative_path = ?, absolute_path = ?,
               content_type = ?, sha256 = ?, size_bytes = ?, last_run_id = ?, last_seen_at = ?,
-              status = ?, snippet = ?, metadata_json = ?
+              status = ?, snippet = ?, metadata_json = ?,
+              content_length = ?, etag = ?, last_modified = ?,
+              download_status = ?, parse_status = ?, parse_quality_flags = ?,
+              delta_state = ?, failure_type = ?
             WHERE doc_id = ?
             """,
             (
-                spec.company_key,
-                spec.company_name,
-                spec.company_folder,
-                spec.ticker,
-                spec.coverage_key,
-                final_url,
-                doc.get("source"),
-                doc.get("origin"),
-                doc.get("form_type"),
-                doc.get("doc_type"),
-                family,
-                doc.get("published_at"),
-                doc.get("title"),
-                filename,
-                relative_path,
-                str(stored_path),
-                content_type,
-                sha256,
-                size_bytes,
-                run_id,
-                now,
-                status,
-                doc.get("text_snippet"),
-                payload,
+                spec.company_key, spec.company_name, spec.company_folder, spec.ticker, spec.coverage_key,
+                final_url, doc.get("source"), doc.get("origin"), doc.get("form_type"),
+                doc.get("doc_type"), family, doc.get("published_at"), doc.get("title"),
+                filename, relative_path, str(stored_path), content_type, sha256, size_bytes,
+                run_id, now, status, doc.get("text_snippet"), payload,
+                content_length, etag, last_modified,
+                download_status, parse_status, quality_flags_json,
+                delta_state, failure_type,
                 existing["doc_id"],
             ),
         )
+        conn.commit()
+        return existing["doc_id"]
     else:
+        doc_id = str(uuid.uuid4())
         conn.execute(
             """
             INSERT INTO documents (
@@ -692,49 +987,199 @@ def upsert_document(
               source_url, final_url, source, origin, form_type, doc_type, doc_family,
               published_at, title, filename, relative_path, absolute_path, content_type,
               sha256, size_bytes, downloaded_at, first_run_id, last_run_id, last_seen_at,
-              status, snippet, metadata_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              status, snippet, metadata_json, first_seen_at,
+              content_length, etag, last_modified,
+              download_status, parse_status, parse_quality_flags,
+              delta_state, failure_type, retry_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                str(uuid.uuid4()),
-                spec.company_key,
-                spec.company_name,
-                spec.company_folder,
-                spec.ticker,
-                spec.coverage_key,
-                doc.get("url"),
-                final_url,
-                doc.get("source"),
-                doc.get("origin"),
-                doc.get("form_type"),
-                doc.get("doc_type"),
-                family,
-                doc.get("published_at"),
-                doc.get("title"),
-                filename,
-                relative_path,
-                str(stored_path),
-                content_type,
-                sha256,
-                size_bytes,
-                now,
-                run_id,
-                run_id,
-                now,
-                status,
-                doc.get("text_snippet"),
-                payload,
+                doc_id, spec.company_key, spec.company_name, spec.company_folder,
+                spec.ticker, spec.coverage_key, doc.get("url"), final_url,
+                doc.get("source"), doc.get("origin"), doc.get("form_type"),
+                doc.get("doc_type"), family, doc.get("published_at"), doc.get("title"),
+                filename, relative_path, str(stored_path), content_type,
+                sha256, size_bytes, now, run_id, run_id, now, status,
+                doc.get("text_snippet"), payload, now,
+                content_length, etag, last_modified,
+                download_status, parse_status, quality_flags_json,
+                delta_state, failure_type, 0,
             ),
         )
-    conn.commit()
+        conn.commit()
+        return doc_id
 
 
 def mark_existing_seen(conn: sqlite3.Connection, existing: dict, run_id: str) -> None:
     conn.execute(
-        "UPDATE documents SET last_run_id = ?, last_seen_at = ?, status = ? WHERE doc_id = ?",
-        (run_id, utc_now_iso(), "existing", existing["doc_id"]),
+        "UPDATE documents SET last_run_id = ?, last_seen_at = ?, status = ?, delta_state = ? WHERE doc_id = ?",
+        (run_id, utc_now_iso(), "existing", "unchanged", existing["doc_id"]),
     )
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Job queue
+# ---------------------------------------------------------------------------
+
+
+def queue_parse_job(
+    conn: sqlite3.Connection,
+    *,
+    doc_id: str,
+    company_key: str,
+    coverage_key: str | None,
+    params: dict | None = None,
+) -> str:
+    """Enqueue a parse job for a newly downloaded document."""
+    job_id = str(uuid.uuid4())
+    conn.execute(
+        """
+        INSERT INTO jobs (job_id, job_type, status, created_at, company_key, coverage_key, doc_id, params_json)
+        VALUES (?, 'parse', 'pending', ?, ?, ?, ?, ?)
+        """,
+        (job_id, utc_now_iso(), company_key, coverage_key, doc_id, json.dumps(params or {})),
+    )
+    conn.commit()
+    return job_id
+
+
+def run_parse_job(
+    conn: sqlite3.Connection,
+    job: dict,
+    *,
+    root: Path,
+) -> None:
+    """
+    Execute a pending parse job.
+
+    Reads the document record, invokes the appropriate parser, saves the
+    parse artifact, and updates document_parses + documents tables.
+    """
+    from official_doc_parsers import parse_document, save_parse_artifact
+
+    job_id = job["job_id"]
+    doc_id = job["doc_id"]
+
+    # Mark started
+    conn.execute(
+        "UPDATE jobs SET status = 'running', started_at = ? WHERE job_id = ?",
+        (utc_now_iso(), job_id),
+    )
+    conn.commit()
+
+    # Load document record
+    row = conn.execute("SELECT * FROM documents WHERE doc_id = ?", (doc_id,)).fetchone()
+    if not row:
+        conn.execute(
+            "UPDATE jobs SET status = 'failed', finished_at = ?, error = ? WHERE job_id = ?",
+            (utc_now_iso(), "document record not found", job_id),
+        )
+        conn.commit()
+        return
+
+    doc = dict(row)
+    abs_path = doc.get("absolute_path") or ""
+    content_type = doc.get("content_type") or ""
+
+    if not abs_path or not Path(abs_path).exists():
+        conn.execute(
+            "UPDATE jobs SET status = 'failed', finished_at = ?, error = ?, failure_type = 'permanent' WHERE job_id = ?",
+            (utc_now_iso(), f"file not found: {abs_path}", job_id),
+        )
+        conn.commit()
+        return
+
+    try:
+        result = parse_document(Path(abs_path), content_type)
+    except Exception as exc:
+        conn.execute(
+            "UPDATE jobs SET status = 'failed', finished_at = ?, error = ?, failure_type = 'transient' WHERE job_id = ?",
+            (utc_now_iso(), str(exc), job_id),
+        )
+        conn.commit()
+        return
+
+    # Save artifact
+    company_folder = doc.get("company_folder") or ""
+    artifact_dir = root / company_folder / META_DIRNAME / PARSES_DIRNAME
+    artifact_path = artifact_dir / f"{doc_id}.json"
+    try:
+        save_parse_artifact(result, artifact_path)
+    except Exception as exc:
+        log.warning("Failed to save parse artifact for %s: %s", doc_id, exc)
+
+    # Upsert parse record
+    parse_id = str(uuid.uuid4())
+    quality_flags_json = json.dumps(result.quality_flags)
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO document_parses
+        (parse_id, doc_id, parsed_at, parser_name, parse_version,
+         text_chars, page_count, table_count, quality_flags, error, artifact_path)
+        VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            parse_id, doc_id, utc_now_iso(), result.parser_name,
+            len(result.text), result.page_count, result.table_count,
+            quality_flags_json, result.error, str(artifact_path) if artifact_path.exists() else None,
+        ),
+    )
+
+    # Update document parse_status and quality flags
+    parse_status = "parsed" if result.ok else "parse_failed"
+    delta_state_update = "failed_parse" if not result.ok else None
+    if delta_state_update:
+        conn.execute(
+            "UPDATE documents SET parse_status = ?, parse_quality_flags = ?, delta_state = ? WHERE doc_id = ?",
+            (parse_status, quality_flags_json, delta_state_update, doc_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE documents SET parse_status = ?, parse_quality_flags = ? WHERE doc_id = ?",
+            (parse_status, quality_flags_json, doc_id),
+        )
+    conn.commit()
+
+    # Mark job complete
+    result_summary = {
+        "parse_id": parse_id,
+        "parser_name": result.parser_name,
+        "ok": result.ok,
+        "text_chars": len(result.text),
+        "page_count": result.page_count,
+        "table_count": result.table_count,
+        "quality_flags": result.quality_flags,
+    }
+    conn.execute(
+        "UPDATE jobs SET status = 'completed', finished_at = ?, result_json = ? WHERE job_id = ?",
+        (utc_now_iso(), json.dumps(result_summary), job_id),
+    )
+    conn.commit()
+
+
+def process_pending_parse_jobs(root: Path, *, limit: int = 50) -> dict:
+    """Run all pending parse jobs up to limit. Returns summary dict."""
+    completed = failed = 0
+    with open_db(root) as conn:
+        jobs = conn.execute(
+            "SELECT * FROM jobs WHERE job_type = 'parse' AND status = 'pending' ORDER BY created_at ASC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        for job in jobs:
+            try:
+                run_parse_job(conn, dict(job), root=root)
+                completed += 1
+            except Exception as exc:
+                failed += 1
+                log.warning("Parse job %s failed: %s", job["job_id"], exc)
+    return {"completed": completed, "failed": failed, "processed": len(jobs)}
+
+
+# ---------------------------------------------------------------------------
+# Main scrape orchestrator
+# ---------------------------------------------------------------------------
 
 
 def run_scrape(
@@ -745,6 +1190,7 @@ def run_scrape(
     days_back: int | None = None,
     max_docs: int | None = None,
     run_id: str | None = None,
+    parse_after_download: bool = False,
 ) -> str:
     default_days, default_max = run_defaults(mode)
     days_back = days_back or default_days
@@ -754,6 +1200,17 @@ def run_scrape(
     run_id = run_id or str(uuid.uuid4())
     conn = open_db(root)
     ensure_run(conn, spec, run_id=run_id, mode=mode, days_back=days_back, max_docs=max_docs)
+
+    # Check if any source is browser-mode
+    try:
+        from official_source_registry import get_registry
+        registry = get_registry()
+        source_entries = registry.for_coverage_key(spec.coverage_key or "") if spec.coverage_key else []
+    except Exception:
+        source_entries = []
+    browser_sources = {e.source_id for e in source_entries if e.download_mode == "browser"}
+    if browser_sources:
+        log.info("Note: sources %s require browser automation (scaffolded, not yet active)", browser_sources)
 
     discovered = downloaded = skipped = errors = 0
     documents: list[dict] = []
@@ -771,6 +1228,8 @@ def run_scrape(
         for idx, doc in enumerate(documents, start=1):
             update_run(conn, run_id, progress_message=f"processing {idx}/{discovered}: {doc.get('title') or doc.get('url')}")
             existing = lookup_existing_document(conn, doc.get("url") or "")
+
+            # If unchanged (file exists + sha256 known), skip download
             if existing and existing.get("absolute_path") and Path(existing["absolute_path"]).exists():
                 skipped += 1
                 mark_existing_seen(conn, existing, run_id)
@@ -780,18 +1239,43 @@ def run_scrape(
             family_dir = company_dir / family_dir_for_document(doc)
             family_dir.mkdir(parents=True, exist_ok=True)
 
+            # Determine download_mode from source registry
+            doc_download_mode = "http"
+            # (Can be extended: look up source entry by URL domain and check download_mode)
+
             try:
-                result = download_with_fallbacks(doc["url"], family_dir)
+                result = download_with_fallbacks(doc["url"], family_dir, download_mode=doc_download_mode)
+                new_sha256 = result["sha256"]
+
+                # Delta tracking
+                delta_state = compute_delta_state(
+                    existing=existing,
+                    new_sha256=new_sha256,
+                    conn=conn,
+                    company_key=spec.company_key,
+                )
+
+                # Only save to disk if truly new or updated content
+                if delta_state == "unchanged" and existing:
+                    # Content unchanged — update metadata but don't re-save file
+                    if os.path.exists(result["temp_path"]):
+                        os.unlink(result["temp_path"])
+                    skipped += 1
+                    mark_existing_seen(conn, existing, run_id)
+                    update_run(conn, run_id, skipped_count=skipped)
+                    continue
+
                 basename = guess_basename(doc, result["final_url"], result["content_type"])
                 filename = canonical_filename(doc, basename)
                 destination = family_dir / filename
                 if destination.exists():
                     stem = destination.stem
                     suffix = destination.suffix
-                    destination = family_dir / f"{stem}_{result['sha256'][:8]}{suffix}"
+                    destination = family_dir / f"{stem}_{new_sha256[:8]}{suffix}"
                 shutil.move(result["temp_path"], destination)
                 relative_path = str(destination.relative_to(root))
-                upsert_document(
+
+                doc_id = upsert_document(
                     conn,
                     spec=spec,
                     run_id=run_id,
@@ -799,7 +1283,7 @@ def run_scrape(
                     stored_path=destination,
                     relative_path=relative_path,
                     content_type=result["content_type"],
-                    sha256=result["sha256"],
+                    sha256=new_sha256,
                     size_bytes=result["size_bytes"],
                     final_url=result["final_url"],
                     filename=destination.name,
@@ -808,9 +1292,50 @@ def run_scrape(
                         "document": doc,
                         "attempts": result["attempts"],
                     },
+                    content_length=result.get("content_length"),
+                    etag=result.get("etag"),
+                    last_modified=result.get("last_modified"),
+                    download_status="downloaded",
+                    parse_status="unparsed",
+                    delta_state=delta_state,
                 )
+
+                # Queue parse job for parseable content types
+                suffix = destination.suffix.lower()
+                if suffix in {".pdf", ".xlsx", ".xls"}:
+                    queue_parse_job(
+                        conn,
+                        doc_id=doc_id,
+                        company_key=spec.company_key,
+                        coverage_key=spec.coverage_key,
+                    )
+
                 downloaded += 1
                 update_run(conn, run_id, downloaded_count=downloaded)
+
+            except BrowserFallbackRequired as exc:
+                log.info("Browser required for %s (not yet active; recording as browser_required)", exc.url)
+                upsert_document(
+                    conn,
+                    spec=spec,
+                    run_id=run_id,
+                    doc=doc,
+                    stored_path=root / spec.company_folder / META_DIRNAME / "missing",
+                    relative_path="",
+                    content_type="",
+                    sha256="",
+                    size_bytes=0,
+                    final_url=doc.get("url") or "",
+                    filename="",
+                    status="error",
+                    metadata={"document": doc, "error": "browser_required"},
+                    download_status="browser_required",
+                    delta_state="failed_download",
+                    failure_type="transient",
+                )
+                errors += 1
+                update_run(conn, run_id, error_count=errors)
+
             except Exception as exc:
                 errors += 1
                 log.warning("Failed to download %s: %s", doc.get("url"), exc)
@@ -827,10 +1352,10 @@ def run_scrape(
                     final_url=doc.get("url") or "",
                     filename="",
                     status="error",
-                    metadata={
-                        "document": doc,
-                        "error": str(exc),
-                    },
+                    metadata={"document": doc, "error": str(exc)},
+                    download_status="error",
+                    delta_state="failed_download",
+                    failure_type="transient",
                 )
                 update_run(conn, run_id, error_count=errors)
 
@@ -846,6 +1371,12 @@ def run_scrape(
             error_count=errors,
             progress_message=f"finished: {downloaded} downloaded, {skipped} skipped, {errors} errors",
         )
+
+        # Optionally run pending parse jobs inline
+        if parse_after_download:
+            parse_summary = process_pending_parse_jobs(root)
+            log.info("Inline parse: %s", parse_summary)
+
         return run_id
     except Exception as exc:
         update_run(
@@ -865,10 +1396,16 @@ def run_scrape(
         conn.close()
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Manage the official document corpus")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    # run
     run_parser = sub.add_parser("run", help="Run a corpus scrape")
     run_parser.add_argument("--coverage-key")
     run_parser.add_argument("--company-name")
@@ -885,19 +1422,39 @@ def parse_args() -> argparse.Namespace:
     run_parser.add_argument("--max-docs", type=int)
     run_parser.add_argument("--run-id")
     run_parser.add_argument("--root", type=Path, default=OFFICIAL_DOC_CORPUS_DIR)
+    run_parser.add_argument("--parse", action="store_true", help="Parse downloaded PDFs/XLSX after scrape")
     run_parser.add_argument("--json", action="store_true")
 
+    # parse
+    parse_parser = sub.add_parser("parse", help="Parse downloaded documents (run pending parse jobs)")
+    parse_parser.add_argument("--root", type=Path, default=OFFICIAL_DOC_CORPUS_DIR)
+    parse_parser.add_argument("--limit", type=int, default=50)
+    parse_parser.add_argument("--doc-id", help="Parse a specific document by ID")
+
+    # list-runs
     list_runs_parser = sub.add_parser("list-runs", help="List recent runs")
     list_runs_parser.add_argument("--root", type=Path, default=OFFICIAL_DOC_CORPUS_DIR)
     list_runs_parser.add_argument("--limit", type=int, default=20)
 
+    # list-docs
     list_docs_parser = sub.add_parser("list-docs", help="List stored documents")
     list_docs_parser.add_argument("--root", type=Path, default=OFFICIAL_DOC_CORPUS_DIR)
     list_docs_parser.add_argument("--company-key")
     list_docs_parser.add_argument("--limit", type=int, default=50)
 
+    # list-companies
     list_companies_parser = sub.add_parser("list-companies", help="List companies in corpus")
     list_companies_parser.add_argument("--root", type=Path, default=OFFICIAL_DOC_CORPUS_DIR)
+
+    # list-jobs
+    list_jobs_parser = sub.add_parser("list-jobs", help="List job queue")
+    list_jobs_parser.add_argument("--root", type=Path, default=OFFICIAL_DOC_CORPUS_DIR)
+    list_jobs_parser.add_argument("--status", choices=["pending", "running", "completed", "failed"])
+    list_jobs_parser.add_argument("--limit", type=int, default=50)
+
+    # stats
+    stats_parser = sub.add_parser("stats", help="Parse/delta state statistics")
+    stats_parser.add_argument("--root", type=Path, default=OFFICIAL_DOC_CORPUS_DIR)
 
     return parser.parse_args()
 
@@ -925,12 +1482,39 @@ def main() -> None:
             days_back=args.days_back,
             max_docs=args.max_docs,
             run_id=args.run_id,
+            parse_after_download=getattr(args, "parse", False),
         )
         payload = {"run_id": run_id, "root": str(args.root), "company_key": spec.company_key}
         if args.json:
             print(json.dumps(payload, indent=2, ensure_ascii=False))
         else:
             print(f"Run complete: {run_id}")
+        return
+
+    if args.command == "parse":
+        if args.doc_id:
+            with open_db(args.root) as conn:
+                job_row = conn.execute(
+                    "SELECT * FROM jobs WHERE doc_id = ? AND job_type = 'parse' AND status = 'pending' LIMIT 1",
+                    (args.doc_id,),
+                ).fetchone()
+                if not job_row:
+                    # Create ad-hoc job
+                    doc_row = conn.execute("SELECT * FROM documents WHERE doc_id = ?", (args.doc_id,)).fetchone()
+                    if not doc_row:
+                        print(f"Document not found: {args.doc_id}", file=sys.stderr)
+                        sys.exit(1)
+                    doc = dict(doc_row)
+                    queue_parse_job(conn, doc_id=args.doc_id, company_key=doc["company_key"], coverage_key=doc.get("coverage_key"))
+                    job_row = conn.execute(
+                        "SELECT * FROM jobs WHERE doc_id = ? AND job_type = 'parse' ORDER BY created_at DESC LIMIT 1",
+                        (args.doc_id,),
+                    ).fetchone()
+                run_parse_job(conn, dict(job_row), root=args.root)
+            print(f"Parsed document {args.doc_id}")
+        else:
+            result = process_pending_parse_jobs(args.root, limit=args.limit)
+            print(json.dumps(result, indent=2, ensure_ascii=False))
         return
 
     if args.command == "list-runs":
@@ -943,6 +1527,14 @@ def main() -> None:
 
     if args.command == "list-companies":
         print(json.dumps(list_companies(args.root), indent=2, ensure_ascii=False))
+        return
+
+    if args.command == "list-jobs":
+        print(json.dumps(list_jobs(args.root, status=args.status, limit=args.limit), indent=2, ensure_ascii=False))
+        return
+
+    if args.command == "stats":
+        print(json.dumps(get_parse_stats(args.root), indent=2, ensure_ascii=False))
         return
 
     raise SystemExit(f"Unknown command: {args.command}")
