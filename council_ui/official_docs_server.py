@@ -95,7 +95,7 @@ def summary_payload() -> dict:
             "Use exchange/filer adapters first when available, then company IR archives.",
             "Per-file downloads retry with alternate request headers and a queryless URL variant when needed.",
             "SEC is live for filing retrieval; LSE, HKEX, and TSE currently function as probe/discovery layers plus IR fallback.",
-            "Sources with download_mode=browser are scaffolded; HTTP-first download is the default for all active sources.",
+            "Sources with download_mode=browser can use the Playwright lane when the dependency is installed; HTTP-first download remains the default for standard sources.",
         ],
     }
 

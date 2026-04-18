@@ -70,6 +70,7 @@ log = setup_logging("official_doc_corpus")
 DB_FILENAME = "corpus.db"
 META_DIRNAME = "_meta"
 PARSES_DIRNAME = "parses"
+DERIVED_DIRNAME = "derived"
 MAX_DOWNLOAD_BYTES = 75 * 1024 * 1024
 DEFAULT_INCREMENTAL_DAYS = 400
 DEFAULT_INCREMENTAL_MAX_DOCS = 25
@@ -100,11 +101,14 @@ CONTENT_TYPE_EXTENSIONS = {
     "application/vnd.ms-excel": ".xls",
 }
 
-PARSEABLE_EXTENSIONS = {".pdf", ".xlsx", ".xls"}
+PARSEABLE_EXTENSIONS = {".pdf", ".xlsx", ".xls", ".html", ".htm", ".txt"}
 PARSEABLE_CONTENT_TYPES = {
     "application/pdf",
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     "application/vnd.ms-excel",
+    "text/html",
+    "application/xhtml+xml",
+    "text/plain",
 }
 
 # ---------------------------------------------------------------------------
@@ -281,6 +285,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             quality_flags TEXT,
             error TEXT,
             artifact_path TEXT,
+            derived_artifact_path TEXT,
             FOREIGN KEY (doc_id) REFERENCES documents(doc_id)
         );
 
@@ -342,6 +347,14 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
                 conn.execute(f"ALTER TABLE documents ADD COLUMN {col_name} {col_type}")
             except sqlite3.OperationalError as exc:
                 log.debug("Column migration skipped (%s): %s", col_name, exc)
+
+    parse_cursor = conn.execute("PRAGMA table_info(document_parses)")
+    parse_existing = {row[1] for row in parse_cursor.fetchall()}
+    if "derived_artifact_path" not in parse_existing:
+        try:
+            conn.execute("ALTER TABLE document_parses ADD COLUMN derived_artifact_path TEXT")
+        except sqlite3.OperationalError as exc:
+            log.debug("Parse column migration skipped (derived_artifact_path): %s", exc)
     conn.commit()
 
 
@@ -386,6 +399,7 @@ def _backfill_legacy_documents(conn: sqlite3.Connection) -> None:
         WHERE first_seen_at IS NULL
            OR download_status IS NULL
            OR parse_status IS NULL
+           OR parse_status = 'not_applicable'
            OR parse_quality_flags IS NULL
            OR delta_state IS NULL
            OR retry_count IS NULL
@@ -408,6 +422,7 @@ def _backfill_legacy_documents(conn: sqlite3.Connection) -> None:
         WHERE first_seen_at IS NULL
            OR download_status IS NULL
            OR parse_status IS NULL
+           OR parse_status = 'not_applicable'
            OR parse_quality_flags IS NULL
            OR delta_state IS NULL
            OR retry_count IS NULL
@@ -427,7 +442,7 @@ def _backfill_legacy_documents(conn: sqlite3.Connection) -> None:
             updates["first_seen_at"] = item.get("downloaded_at") or item.get("last_seen_at") or utc_now_iso()
         if item.get("download_status") is None:
             updates["download_status"] = inferred_download
-        if item.get("parse_status") is None:
+        if item.get("parse_status") is None or item.get("parse_status") == "not_applicable":
             if item["doc_id"] in parse_map:
                 updates["parse_status"] = "parsed" if parse_map[item["doc_id"]] else "parse_failed"
             else:
@@ -836,6 +851,147 @@ def conditional_request_headers(existing: dict | None) -> dict[str, str]:
     return headers
 
 
+def _domain_matches(hostname: str, allowed_domains: list[str]) -> bool:
+    host = (hostname or "").lower()
+    for domain in allowed_domains:
+        candidate = (domain or "").lower()
+        if host == candidate or host.endswith(f".{candidate}"):
+            return True
+    return False
+
+
+def resolve_source_entry_for_document(doc: dict, source_entries: list[Any]) -> Any | None:
+    doc_url = doc.get("url") or ""
+    hostname = (urlparse(doc_url).hostname or "").lower()
+    origin = (doc.get("origin") or "").lower()
+
+    for entry in source_entries:
+        allowed = list(dict.fromkeys((entry.allowed_domains or []) + ([entry.domain] if getattr(entry, "domain", None) else [])))
+        if hostname and _domain_matches(hostname, allowed):
+            return entry
+
+    for entry in source_entries:
+        source_id = getattr(entry, "source_id", "")
+        if origin == "sec" and source_id.endswith("/sec"):
+            return entry
+        if origin == "ir" and source_id.endswith("/ir"):
+            return entry
+    return None
+
+
+def _content_type_from_name(name: str) -> str:
+    suffix = Path(name or "").suffix.lower()
+    mapping = {
+        ".pdf": "application/pdf",
+        ".html": "text/html",
+        ".htm": "text/html",
+        ".txt": "text/plain",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".xls": "application/vnd.ms-excel",
+    }
+    return mapping.get(suffix, "application/octet-stream")
+
+
+def download_with_browser(url: str, target_dir: Path, *, existing: dict | None = None) -> dict:
+    try:
+        from playwright.sync_api import sync_playwright  # type: ignore[import-untyped]
+    except ImportError as exc:
+        raise BrowserFallbackRequired(url) from exc
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    attempts: list[dict] = []
+    conditional_headers = conditional_request_headers(existing)
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        context = browser.new_context(accept_downloads=True, extra_http_headers=conditional_headers or None)
+        page = context.new_page()
+        download_holder: dict[str, Any] = {}
+        page.on("download", lambda download: download_holder.setdefault("download", download))
+        try:
+            try:
+                response = page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+            except Exception as exc:
+                if "Download is starting" not in str(exc):
+                    raise
+                page.wait_for_timeout(1_000)
+                download = download_holder.get("download")
+                if download is None:
+                    raise
+                temp_path = str(Path(tempfile.NamedTemporaryFile(delete=False, dir=target_dir).name))
+                download.save_as(temp_path)
+                body = Path(temp_path).read_bytes()
+                if len(body) > MAX_DOWNLOAD_BYTES:
+                    Path(temp_path).unlink(missing_ok=True)
+                    raise ValueError(f"download exceeded {MAX_DOWNLOAD_BYTES} bytes")
+                final_url = getattr(download, "url", None) or page.url or url
+                suggested_name = getattr(download, "suggested_filename", None) or Path(final_url).name
+                return {
+                    "result": "downloaded",
+                    "temp_path": temp_path,
+                    "final_url": final_url,
+                    "content_type": _content_type_from_name(suggested_name or final_url),
+                    "content_length": len(body),
+                    "etag": (existing or {}).get("etag"),
+                    "last_modified": (existing or {}).get("last_modified"),
+                    "size_bytes": len(body),
+                    "sha256": hashlib.sha256(body).hexdigest(),
+                    "attempts": [{"url": url, "headers": "browser", "status": 200, "result": "download"}],
+                }
+
+            if response is None:
+                raise RuntimeError(f"browser navigation produced no response for {url}")
+
+            etag = response.headers.get("etag") or (existing or {}).get("etag")
+            last_modified = response.headers.get("last-modified") or (existing or {}).get("last_modified")
+            content_type = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
+            content_length_str = response.headers.get("content-length") or ""
+            content_length = int(content_length_str) if content_length_str.isdigit() else (existing or {}).get("content_length")
+
+            if response.status == 304:
+                return {
+                    "result": "not_modified",
+                    "temp_path": None,
+                    "final_url": page.url,
+                    "content_type": (existing or {}).get("content_type") or content_type,
+                    "content_length": content_length,
+                    "etag": etag,
+                    "last_modified": last_modified,
+                    "size_bytes": (existing or {}).get("size_bytes") or 0,
+                    "sha256": (existing or {}).get("sha256") or "",
+                    "attempts": [{"url": url, "headers": "browser", "status": 304, "result": "not_modified"}],
+                }
+
+            body = response.body()
+            if not body and content_type.startswith("text/html"):
+                page.wait_for_load_state("networkidle", timeout=15_000)
+                body = page.content().encode("utf-8")
+            if not body:
+                raise RuntimeError(f"browser fetch returned empty body for {url}")
+
+            if len(body) > MAX_DOWNLOAD_BYTES:
+                raise ValueError(f"download exceeded {MAX_DOWNLOAD_BYTES} bytes")
+
+            with tempfile.NamedTemporaryFile(delete=False, dir=target_dir) as tmp:
+                tmp.write(body)
+                temp_path = tmp.name
+            return {
+                "result": "downloaded",
+                "temp_path": temp_path,
+                "final_url": page.url,
+                "content_type": content_type or "text/html",
+                "content_length": content_length or len(body),
+                "etag": etag,
+                "last_modified": last_modified,
+                "size_bytes": len(body),
+                "sha256": hashlib.sha256(body).hexdigest(),
+                "attempts": [{"url": url, "headers": "browser", "status": response.status, "result": "ok"}],
+            }
+        finally:
+            context.close()
+            browser.close()
+
+
 def url_variants(url: str) -> list[str]:
     variants = [url]
     parsed = urlparse(url)
@@ -865,7 +1021,7 @@ def download_with_fallbacks(
       RuntimeError             if all HTTP attempts fail
     """
     if download_mode == "browser":
-        raise BrowserFallbackRequired(url)
+        return download_with_browser(url, target_dir, existing=existing)
 
     attempts: list[dict] = []
     last_error: str | None = None
@@ -939,6 +1095,14 @@ def download_with_fallbacks(
                 if resp is not None:
                     resp.close()
 
+    if download_mode == "mixed":
+        try:
+            return download_with_browser(url, target_dir, existing=existing)
+        except BrowserFallbackRequired as exc:
+            raise BrowserFallbackRequired(url) from exc
+        except Exception as exc:
+            last_error = f"{last_error or 'http failed'}; browser fallback failed: {exc}"
+
     raise RuntimeError(last_error or f"download failed for {url}")
 
 
@@ -970,7 +1134,7 @@ def save_site_learning(root: Path, spec: CompanySpec, documents: list[dict]) -> 
         "Primary source order is exchange/filer adapter first when available, then company IR archive.",
         "Download fallbacks per file try direct URL first, then alternate request headers, then a queryless URL variant when the source URL includes query parameters.",
         "Current limitation: LSE, HKEX, and TSE adapters are still probe/discovery layers, so historical corpus builds for those names rely mostly on IR archives today.",
-        "Sources configured as download_mode=browser are scaffolded but not yet fetched; set download_mode=http or mixed to enable HTTP-first download.",
+        "Sources configured as download_mode=browser can use the Playwright lane when Playwright + Chromium are installed; otherwise they still record browser_required for auditing.",
     ]
 
     payload = {
@@ -1220,6 +1384,37 @@ def mark_existing_seen(
     conn.commit()
 
 
+def is_parseable_document(*, filename: str | None, absolute_path: str | None, content_type: str | None) -> bool:
+    suffix = Path(filename or absolute_path or "").suffix.lower()
+    if suffix in PARSEABLE_EXTENSIONS:
+        return True
+    return (content_type or "").lower() in PARSEABLE_CONTENT_TYPES
+
+
+def ensure_parse_job_for_document(conn: sqlite3.Connection, doc: dict) -> str | None:
+    if not is_parseable_document(
+        filename=doc.get("filename"),
+        absolute_path=doc.get("absolute_path"),
+        content_type=doc.get("content_type"),
+    ):
+        return None
+    parse_status = doc.get("parse_status") or "unparsed"
+    if parse_status == "parsed":
+        return None
+    existing_job = conn.execute(
+        "SELECT job_id FROM jobs WHERE doc_id = ? AND job_type = 'parse' AND status IN ('pending', 'running') LIMIT 1",
+        (doc["doc_id"],),
+    ).fetchone()
+    if existing_job:
+        return existing_job["job_id"]
+    return queue_parse_job(
+        conn,
+        doc_id=doc["doc_id"],
+        company_key=doc.get("company_key") or "",
+        coverage_key=doc.get("coverage_key"),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Job queue
 # ---------------------------------------------------------------------------
@@ -1258,7 +1453,13 @@ def run_parse_job(
     Reads the document record, invokes the appropriate parser, saves the
     parse artifact, and updates document_parses + documents tables.
     """
-    from official_doc_parsers import parse_document, save_parse_artifact
+    from official_doc_parsers import (
+        build_derived_artifact,
+        load_parse_artifact,
+        parse_document,
+        save_derived_artifact,
+        save_parse_artifact,
+    )
 
     job_id = job["job_id"]
     doc_id = job["doc_id"]
@@ -1306,10 +1507,19 @@ def run_parse_job(
     company_folder = doc.get("company_folder") or ""
     artifact_dir = root / company_folder / META_DIRNAME / PARSES_DIRNAME
     artifact_path = artifact_dir / f"{doc_id}.json"
+    previous_result = load_parse_artifact(artifact_path)
     try:
         save_parse_artifact(result, artifact_path)
     except Exception as exc:
         log.warning("Failed to save parse artifact for %s: %s", doc_id, exc)
+
+    derived_dir = root / company_folder / META_DIRNAME / DERIVED_DIRNAME
+    derived_path = derived_dir / f"{doc_id}.json"
+    try:
+        derived_artifact = build_derived_artifact(result, previous_result=previous_result)
+        save_derived_artifact(derived_artifact, derived_path)
+    except Exception as exc:
+        log.warning("Failed to save derived artifact for %s: %s", doc_id, exc)
 
     # Upsert parse record
     parse_id = str(uuid.uuid4())
@@ -1318,13 +1528,15 @@ def run_parse_job(
         """
         INSERT OR REPLACE INTO document_parses
         (parse_id, doc_id, parsed_at, parser_name, parse_version,
-         text_chars, page_count, table_count, quality_flags, error, artifact_path)
-        VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+         text_chars, page_count, table_count, quality_flags, error, artifact_path, derived_artifact_path)
+        VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             parse_id, doc_id, utc_now_iso(), result.parser_name,
             len(result.text), result.page_count, result.table_count,
-            quality_flags_json, result.error, str(artifact_path) if artifact_path.exists() else None,
+            quality_flags_json, result.error,
+            str(artifact_path) if artifact_path.exists() else None,
+            str(derived_path) if derived_path.exists() else None,
         ),
     )
 
@@ -1432,8 +1644,13 @@ def run_scrape(
             existing_file_present = bool(existing and existing.get("absolute_path") and Path(existing["absolute_path"]).exists())
             has_conditional_validators = bool(existing_file_present and conditional_request_headers(existing))
 
+            source_entry = resolve_source_entry_for_document(doc, source_entries)
+            doc_download_mode = getattr(source_entry, "download_mode", "http") if source_entry else "http"
+
             # Legacy fast-path when we have a file but no validators to revalidate with.
             if existing_file_present and not has_conditional_validators:
+                if parse_after_download and existing:
+                    ensure_parse_job_for_document(conn, existing)
                 skipped += 1
                 mark_existing_seen(conn, existing, run_id)
                 update_run(conn, run_id, skipped_count=skipped)
@@ -1441,10 +1658,6 @@ def run_scrape(
 
             family_dir = company_dir / family_dir_for_document(doc)
             family_dir.mkdir(parents=True, exist_ok=True)
-
-            # Determine download_mode from source registry
-            doc_download_mode = "http"
-            # (Can be extended: look up source entry by URL domain and check download_mode)
 
             try:
                 result = download_with_fallbacks(
@@ -1458,6 +1671,8 @@ def run_scrape(
                     log.info("Not modified (304): %s", doc.get("url"))
                     skipped += 1
                     if existing:
+                        if parse_after_download:
+                            ensure_parse_job_for_document(conn, existing)
                         mark_existing_seen(
                             conn,
                             existing,

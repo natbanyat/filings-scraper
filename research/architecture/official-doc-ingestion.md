@@ -165,23 +165,30 @@ All seven architecture items above are now implemented in code:
    - `PDFParser`: pypdf native text + optional pdfplumber table extraction;
      OCR-needed flag via text-density heuristic (`< 150 chars/page`)
    - `XLSXParser`: openpyxl workbook metadata, per-sheet extraction, hidden/protected detection
+   - `HTMLParser`: BeautifulSoup + Trafilatura normalization for SEC exhibit pages and text docs,
+     with heading metadata and HTML table preview extraction
    - `parse_document(path, content_type)` dispatcher
    - `save_parse_artifact()` / `load_parse_artifact()` for JSON artifact persistence
    - Quality flags: `ocr_needed`, `low_text_density`, `tables_found`, `has_hidden_sheets`,
-     `has_protected_sheet`, `partial_text`, `empty_output`
+     `has_protected_sheet`, `partial_text`, `empty_output`, `html_normalized`
 
 4. **Delta tracking** (`run_scrape()`, `compute_delta_state()`, `find_by_sha256()`)
    - States: `new`, `unchanged`, `updated`, `duplicate`, `moved`, `failed_download`, `failed_parse`
    - Hash-based: unchanged if SHA256 matches existing record; duplicate if SHA256 matches different URL
    - `unchanged` docs skip re-download; `updated` docs re-save with new hash
 
-5. **Browser fallback scaffolding**
-   - `BrowserFallbackRequired` exception with `url` and `source_id` attributes
-   - `download_with_fallbacks(url, target_dir, download_mode=)` respects `download_mode=browser`
-   - LSE sources in registry get `download_mode=browser` (transparent, no active crawl yet)
-   - `browser_required` download_status recorded in manifest for auditing
+5. **Browser fallback lane**
+   - `download_with_fallbacks(url, target_dir, download_mode=)` now routes `download_mode=browser`
+     through a Playwright-backed downloader when available
+   - Direct browser-triggered downloads are handled, including pages that start a file download instead of rendering inline
+   - `download_mode=mixed` preserves HTTP-first behavior while allowing browser fallback on failure
+   - `browser_required` download_status is still recorded when the browser dependency is unavailable
 
-6. **UI** (`council_ui/official_docs_server.py`)
+6. **AI-ready derived artifacts**
+   - parse jobs now write `_meta/derived/<doc_id>.json` alongside parse artifacts
+   - derived artifacts include normalized excerpts, chunked text, table previews, and a lightweight delta summary vs the prior parse artifact
+
+7. **UI** (`council_ui/official_docs_server.py`)
    - `/api/registry` — full source registry as JSON
    - `/api/jobs` — job queue with status/type filters
    - `/api/parse-records` — document parse history
@@ -190,7 +197,7 @@ All seven architecture items above are now implemented in code:
      delta-state and parse-status columns in documents table, jobs card with tab filter,
      source registry card, download_mode=browser highlighted in warn color
 
-7. **New CLI commands** (`official_doc_corpus.py`)
+8. **New CLI commands** (`official_doc_corpus.py`)
    - `parse [--limit N] [--doc-id ID]` — run pending parse jobs
    - `list-jobs [--status STATUS]` — view job queue
    - `stats` — parse/delta/job aggregate counts
@@ -199,9 +206,9 @@ All seven architecture items above are now implemented in code:
 ## Remaining limits
 - Non-SEC exchange filings (LSE, HKEX, TSE) still not fetched — probe/scaffold only
 - IR date extraction is heuristic and misses some page layouts
-- Browser automation backend (Playwright) not yet wired — `browser_required` is recorded but not actioned
+- Browser automation now works for browser-routed downloads, but listing-page discovery for exchanges like LSE is still limited by the upstream fetcher/adapters
 - Corpus incrementality now uses stored `ETag` / `Last-Modified` validators when available, but legacy rows without validators still fall back to manifest/file-presence shortcuts
-- AI-ready derived artifacts (chunks, delta summaries) not yet implemented
+- Derived artifacts are lightweight and local-first today, not yet full research summaries or embedding-ready vector indexes
 
 ## Practical target state
 A daily pipeline should ideally work in this order:

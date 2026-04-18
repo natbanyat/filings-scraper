@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import traceback
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -36,6 +37,9 @@ PDF_LOW_TEXT_DENSITY_CHARS_PER_PAGE = 150
 PDF_MAX_PAGES = 500
 # Maximum rows to preview per sheet in XLSX output
 XLSX_PREVIEW_ROWS = 10
+HTML_PREVIEW_ROWS = 10
+DERIVED_CHUNK_TARGET_CHARS = 1800
+DERIVED_CHUNK_OVERLAP_CHARS = 200
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +72,7 @@ class ParseResult:
       - ocr_needed         : PDF has too little native text (likely scanned)
       - low_text_density   : < PDF_LOW_TEXT_DENSITY_CHARS_PER_PAGE chars/page on average
       - tables_found       : pdfplumber found >=1 table
+      - html_normalized    : HTML main content extracted and normalized
       - has_hidden_sheets  : XLSX has at least one hidden sheet
       - has_protected_sheet: XLSX has at least one protected sheet
       - partial_text       : text was truncated due to page/size limit
@@ -322,11 +327,237 @@ class XLSXParser:
 
 
 # ---------------------------------------------------------------------------
+# HTML / text parser
+# ---------------------------------------------------------------------------
+
+
+class HTMLParser:
+    """Parse HTML/text documents into normalized text plus lightweight tables."""
+
+    def parse(self, path: Path) -> ParseResult:
+        source = str(path)
+        try:
+            raw = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception as exc:
+            return ParseResult(
+                parser_name="html",
+                ok=False,
+                error=f"html read error: {exc}",
+                source_path=source,
+            )
+
+        suffix = path.suffix.lower()
+        if suffix == ".txt":
+            text = _normalize_whitespace(raw)
+            quality_flags = ["empty_output"] if not text else []
+            return ParseResult(
+                parser_name="text",
+                ok=True,
+                text=text,
+                page_count=None,
+                table_count=0,
+                quality_flags=quality_flags,
+                metadata={"title": path.name},
+                tables=[],
+                error=None,
+                source_path=source,
+            )
+
+        try:
+            from bs4 import BeautifulSoup  # type: ignore[import-untyped]
+        except ImportError:
+            return ParseResult(
+                parser_name="html",
+                ok=False,
+                error="beautifulsoup4 not installed",
+                source_path=source,
+            )
+
+        soup = BeautifulSoup(raw, "html.parser")
+        title = (soup.title.string or "").strip() if soup.title and soup.title.string else ""
+        description = ""
+        meta_desc = soup.find("meta", attrs={"name": re.compile("description", re.I)})
+        if meta_desc:
+            description = (meta_desc.get("content") or "").strip()
+
+        extracted = ""
+        try:
+            import trafilatura  # type: ignore[import-untyped]
+            extracted = trafilatura.extract(raw, include_tables=True, include_comments=False, include_links=False) or ""
+        except Exception:
+            extracted = ""
+
+        if not extracted:
+            for tag in soup(["script", "style", "noscript"]):
+                tag.decompose()
+            extracted = soup.get_text("\n")
+
+        text = _normalize_whitespace(extracted)
+        headings = [_normalize_whitespace(node.get_text(" ")) for node in soup.find_all(["h1", "h2", "h3"]) if _normalize_whitespace(node.get_text(" "))]
+        tables = _extract_html_tables(soup)
+        quality_flags: list[str] = []
+        if text:
+            quality_flags.append("html_normalized")
+        if tables:
+            quality_flags.append("tables_found")
+        if not text:
+            quality_flags.append("empty_output")
+
+        return ParseResult(
+            parser_name="html",
+            ok=bool(text) or bool(tables),
+            text=text,
+            page_count=None,
+            table_count=len(tables),
+            quality_flags=list(dict.fromkeys(quality_flags)),
+            metadata={
+                "title": title,
+                "description": description,
+                "headings": headings[:25],
+                "heading_count": len(headings),
+            },
+            tables=tables,
+            error=None,
+            source_path=source,
+        )
+
+
+def _normalize_whitespace(text: str) -> str:
+    text = text.replace("\r", "\n")
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    return "\n".join(line.strip() for line in text.splitlines() if line.strip()).strip()
+
+
+def _extract_html_tables(soup) -> list[dict]:
+    tables: list[dict] = []
+    for table_index, table in enumerate(soup.find_all("table")):
+        rows: list[list[str]] = []
+        for row in table.find_all("tr"):
+            cells = row.find_all(["th", "td"])
+            if not cells:
+                continue
+            values = [_normalize_whitespace(cell.get_text(" ")) for cell in cells]
+            if any(values):
+                rows.append(values)
+        if not rows:
+            continue
+        headers = rows[0]
+        preview_rows = rows[1:HTML_PREVIEW_ROWS + 1] if len(rows) > 1 else []
+        tables.append({
+            "table_index": table_index,
+            "headers": headers,
+            "rows": preview_rows,
+            "total_rows": max(len(rows) - 1, 0),
+        })
+    return tables
+
+
+def _chunk_text(text: str, *, target_chars: int = DERIVED_CHUNK_TARGET_CHARS, overlap_chars: int = DERIVED_CHUNK_OVERLAP_CHARS) -> list[dict]:
+    cleaned = _normalize_whitespace(text)
+    if not cleaned:
+        return []
+    paragraphs = [p.strip() for p in re.split(r"\n\n+", cleaned) if p.strip()]
+    chunks: list[dict] = []
+    current = ""
+    char_cursor = 0
+
+    for paragraph in paragraphs:
+        candidate = f"{current}\n\n{paragraph}".strip() if current else paragraph
+        if current and len(candidate) > target_chars:
+            chunk_text = current.strip()
+            chunks.append({
+                "chunk_index": len(chunks),
+                "char_start": char_cursor,
+                "char_end": char_cursor + len(chunk_text),
+                "text": chunk_text,
+            })
+            char_cursor = max(char_cursor + len(chunk_text) - overlap_chars, 0)
+            current = (chunk_text[-overlap_chars:] + "\n\n" + paragraph).strip() if overlap_chars else paragraph
+        else:
+            current = candidate
+
+    if current.strip():
+        chunk_text = current.strip()
+        chunks.append({
+            "chunk_index": len(chunks),
+            "char_start": char_cursor,
+            "char_end": char_cursor + len(chunk_text),
+            "text": chunk_text,
+        })
+    return chunks
+
+
+def _delta_summary(current_text: str, previous_text: str) -> dict:
+    current = _normalize_whitespace(current_text)
+    previous = _normalize_whitespace(previous_text)
+    if not previous:
+        return {"status": "initial", "has_prior": False}
+    if current == previous:
+        return {"status": "unchanged", "has_prior": True, "similarity": 1.0}
+
+    import difflib
+
+    current_lines = [line for line in current.splitlines() if line.strip()]
+    previous_lines = [line for line in previous.splitlines() if line.strip()]
+    diff = list(difflib.ndiff(previous_lines[:200], current_lines[:200]))
+    added = [line[2:] for line in diff if line.startswith("+ ")][:5]
+    removed = [line[2:] for line in diff if line.startswith("- ")][:5]
+    similarity = difflib.SequenceMatcher(None, previous[:20000], current[:20000]).ratio()
+    return {
+        "status": "changed",
+        "has_prior": True,
+        "similarity": round(similarity, 4),
+        "added_examples": added,
+        "removed_examples": removed,
+    }
+
+
+def build_derived_artifact(result: ParseResult, *, previous_result: ParseResult | None = None) -> dict:
+    normalized_text = _normalize_whitespace(result.text)
+    chunks = _chunk_text(normalized_text)
+    excerpt = normalized_text[:600]
+    return {
+        "parser_name": result.parser_name,
+        "source_path": result.source_path,
+        "text_chars": len(result.text),
+        "normalized_text_chars": len(normalized_text),
+        "quality_flags": list(result.quality_flags),
+        "summary": {
+            "title": (result.metadata or {}).get("title") or Path(result.source_path).name,
+            "excerpt": excerpt,
+            "table_count": result.table_count or 0,
+            "page_count": result.page_count,
+        },
+        "chunks": chunks,
+        "chunk_count": len(chunks),
+        "tables_preview": result.tables[:20],
+        "delta": _delta_summary(normalized_text, previous_result.text if previous_result else ""),
+    }
+
+
+def save_derived_artifact(artifact: dict, artifact_path: Path) -> None:
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text(json.dumps(artifact, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_derived_artifact(artifact_path: Path) -> dict | None:
+    if not artifact_path.exists():
+        return None
+    try:
+        return json.loads(artifact_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log.warning("Failed to load derived artifact %s: %s", artifact_path, exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
 
 _PDF_PARSER = PDFParser()
 _XLSX_PARSER = XLSXParser()
+_HTML_PARSER = HTMLParser()
 
 
 def parse_document(path: Path, content_type: str = "") -> ParseResult:
@@ -349,16 +580,9 @@ def parse_document(path: Path, content_type: str = "") -> ParseResult:
     ):
         return _XLSX_PARSER.parse(path)
 
-    # HTML/text: return a stub (text parsing is handled inline in fetcher)
+    # HTML/text
     if suffix in {".html", ".htm", ".txt"} or "html" in ct_lower or "text/" in ct_lower:
-        return ParseResult(
-            parser_name="text",
-            ok=True,
-            text="",
-            quality_flags=["text_not_parsed"],
-            source_path=str(path),
-            error=None,
-        )
+        return _HTML_PARSER.parse(path)
 
     return ParseResult(
         parser_name="unknown",
