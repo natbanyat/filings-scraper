@@ -100,11 +100,46 @@ Then add diff logic for:
 Pass official-doc snippets into Pass 1 and Pass 2 as a high-priority source bucket.
 If an official document exists for a topic, secondary media should be demoted unless it adds genuinely incremental context.
 
+## Pinned architecture direction, updated after external review
+The latest architecture review does not change the core direction. It sharpens it.
+
+### Keep
+- Deterministic ingestion core, agent-assisted control plane
+- HTTP-first discovery and download path
+- Browser automation only as a fallback for JS, auth, or click-download flows
+- Official docs as a higher-priority source bucket than general web/news fetches
+
+### Add next
+1. **Source registry separate from `TICKER_META`**
+   - maintain explicit source records with seed URLs, allowed domains, crawl mode, download mode, parse profile, poll frequency, and owner
+   - this should prevent crawler logic from spreading into one-off ticker metadata hacks
+2. **Manifest DB as the real system of record**
+   - extend corpus metadata to include response headers, content length, ETag, Last-Modified, parse status, and parse quality flags
+   - the raw file store remains immutable storage, but the manifest becomes the truth for tracking state
+3. **Parser / normalization workers**
+   - PDFs: native extraction first, table extraction where possible, OCR only as fallback
+   - XLSX: workbook metadata, per-sheet extraction, normalized tables, and flags for hidden/protected sheets
+4. **True delta and version tracking**
+   - track `new`, `unchanged`, `updated`, `duplicate`, `moved`, `failed_download`, and `failed_parse`
+   - do not treat a new URL as a new document by default, use hash plus metadata plus parsed-text comparison where needed
+5. **AI-ready derived artifacts**
+   - clean chunks, extracted tables, metadata JSON, short summaries, and delta summaries vs prior versions
+   - for investing use cases, the change log is often more valuable than the raw file itself
+6. **Browser fallback lane, not browser-first architecture**
+   - use Playwright only when direct HTTP fails or the site truly requires JS/session state
+   - keep the easy 80% on the simple deterministic path
+
+### Framework choice
+- If the source mix stays mostly public, static, and Python-friendly, `Scrapy + HTTPX + Playwright fallback` is the clean low-complexity choice.
+- If the source mix grows toward more JS-heavy or auth-heavy IR/document centers, `Crawlee + HTTPX + Playwright fallback` is the better long-run default.
+- Either way, the parser/storage/delta layers matter more than the crawler brand.
+
 ## Limits of the first pass
 - IR date extraction is heuristic and will miss some page layouts
 - non-SEC exchange filings are not yet implemented
 - some IR sites will still require per-site tuning
 - PDFs are text-extracted only, with no table normalization yet
+- corpus incrementality is still mostly URL/path based, not full remote change detection
 
 ## Practical target state
 A daily pipeline should ideally work in this order:
@@ -113,4 +148,12 @@ A daily pipeline should ideally work in this order:
 3. top-tier wires
 4. broader search only as a fallback
 
-That should materially improve source quality and reduce false positives.
+And the document pipeline should ideally work in this order:
+1. source registry
+2. HTTP-first discovery and download
+3. Playwright fallback only when needed
+4. manifest DB + immutable raw storage
+5. parser / normalization workers
+6. delta summaries and research-facing outputs
+
+That should materially improve source quality, reduce false positives, and turn the corpus from a file cabinet into a usable research substrate.
