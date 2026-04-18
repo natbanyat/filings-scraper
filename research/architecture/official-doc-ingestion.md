@@ -200,7 +200,7 @@ All seven architecture items above are now implemented in code:
 - Non-SEC exchange filings (LSE, HKEX, TSE) still not fetched — probe/scaffold only
 - IR date extraction is heuristic and misses some page layouts
 - Browser automation backend (Playwright) not yet wired — `browser_required` is recorded but not actioned
-- Corpus incrementality for unchanged files is hash-based, not ETag/conditional-GET yet
+- Corpus incrementality now uses stored `ETag` / `Last-Modified` validators when available, but legacy rows without validators still fall back to manifest/file-presence shortcuts
 - AI-ready derived artifacts (chunks, delta summaries) not yet implemented
 
 ## Practical target state

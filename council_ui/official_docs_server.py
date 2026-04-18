@@ -147,7 +147,7 @@ async def index(_: web.Request) -> web.Response:
   .status-running { color:var(--warn); }
   .status-completed,.status-parsed,.status-downloaded,.delta-new { color:var(--good); }
   .status-completed_with_errors,.status-failed,.status-parse_failed,.delta-failed_download,.delta-failed_parse { color:var(--bad); }
-  .status-pending,.delta-unchanged,.status-unparsed { color:var(--muted); }
+  .status-pending,.delta-unchanged,.status-unparsed,.status-not_applicable { color:var(--muted); }
   .delta-updated { color:var(--warn); }
   .delta-duplicate { color:var(--info); }
   table { width:100%; border-collapse:collapse; font-size:13px; }
@@ -346,7 +346,7 @@ function renderSummary(data) {
 
   // Stats
   const ps = data.parse_stats || {};
-  renderStatGrid('stat-parse', ps.parse_status, {parsed:'status-parsed',parse_failed:'status-parse_failed',unparsed:'status-unparsed'});
+  renderStatGrid('stat-parse', ps.parse_status, {parsed:'status-parsed',parse_failed:'status-parse_failed',unparsed:'status-unparsed',not_applicable:'status-not_applicable'});
   renderStatGrid('stat-delta', ps.delta_state, {new:'delta-new',updated:'delta-updated',unchanged:'delta-unchanged',duplicate:'delta-duplicate',failed_download:'delta-failed_download',failed_parse:'delta-failed_parse'});
   renderStatGrid('stat-jobs', ps.jobs, {pending:'status-pending',running:'status-running',completed:'status-completed',failed:'status-failed'});
 

@@ -100,6 +100,13 @@ CONTENT_TYPE_EXTENSIONS = {
     "application/vnd.ms-excel": ".xls",
 }
 
+PARSEABLE_EXTENSIONS = {".pdf", ".xlsx", ".xls"}
+PARSEABLE_CONTENT_TYPES = {
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.ms-excel",
+}
+
 # ---------------------------------------------------------------------------
 # Exceptions
 # ---------------------------------------------------------------------------
@@ -196,6 +203,7 @@ def open_db(root: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys=ON")
     ensure_schema(conn)
     _migrate_schema(conn)
+    _backfill_legacy_documents(conn)
     return conn
 
 
@@ -334,6 +342,118 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
                 conn.execute(f"ALTER TABLE documents ADD COLUMN {col_name} {col_type}")
             except sqlite3.OperationalError as exc:
                 log.debug("Column migration skipped (%s): %s", col_name, exc)
+    conn.commit()
+
+
+def _infer_download_status(*, status: str | None, absolute_path: str | None) -> str:
+    if status == "error":
+        return "error"
+    if absolute_path:
+        return "downloaded"
+    return status or "unknown"
+
+
+def _infer_parse_status(
+    *,
+    absolute_path: str | None,
+    filename: str | None,
+    content_type: str | None,
+    download_status: str | None,
+) -> str:
+    if download_status not in {"downloaded", "existing"} and not absolute_path:
+        return "not_applicable"
+    suffix = Path(filename or absolute_path or "").suffix.lower()
+    if suffix in PARSEABLE_EXTENSIONS:
+        return "unparsed"
+    if (content_type or "").lower() in PARSEABLE_CONTENT_TYPES:
+        return "unparsed"
+    return "not_applicable"
+
+
+def _infer_delta_state(*, status: str | None, download_status: str | None, absolute_path: str | None) -> str:
+    if status == "error" or download_status in {"error", "browser_required"}:
+        return "failed_download"
+    if absolute_path or download_status in {"downloaded", "existing"}:
+        return "unchanged"
+    return "new"
+
+
+def _backfill_legacy_documents(conn: sqlite3.Connection) -> None:
+    needs_backfill = conn.execute(
+        """
+        SELECT COUNT(*) AS cnt
+        FROM documents
+        WHERE first_seen_at IS NULL
+           OR download_status IS NULL
+           OR parse_status IS NULL
+           OR parse_quality_flags IS NULL
+           OR delta_state IS NULL
+           OR retry_count IS NULL
+        """
+    ).fetchone()["cnt"]
+    if not needs_backfill:
+        return
+
+    parse_rows = conn.execute(
+        "SELECT doc_id, MAX(CASE WHEN error IS NULL OR error = '' THEN 1 ELSE 0 END) AS has_success FROM document_parses GROUP BY doc_id"
+    ).fetchall()
+    parse_map = {row["doc_id"]: bool(row["has_success"]) for row in parse_rows}
+
+    rows = conn.execute(
+        """
+        SELECT doc_id, absolute_path, filename, content_type, status, download_status,
+               parse_status, parse_quality_flags, delta_state, first_seen_at,
+               downloaded_at, last_seen_at, retry_count
+        FROM documents
+        WHERE first_seen_at IS NULL
+           OR download_status IS NULL
+           OR parse_status IS NULL
+           OR parse_quality_flags IS NULL
+           OR delta_state IS NULL
+           OR retry_count IS NULL
+        """
+    ).fetchall()
+
+    for row in rows:
+        item = dict(row)
+        updates: dict[str, Any] = {}
+        absolute_path = item.get("absolute_path") or ""
+        inferred_download = item.get("download_status") or _infer_download_status(
+            status=item.get("status"),
+            absolute_path=absolute_path,
+        )
+
+        if item.get("first_seen_at") is None:
+            updates["first_seen_at"] = item.get("downloaded_at") or item.get("last_seen_at") or utc_now_iso()
+        if item.get("download_status") is None:
+            updates["download_status"] = inferred_download
+        if item.get("parse_status") is None:
+            if item["doc_id"] in parse_map:
+                updates["parse_status"] = "parsed" if parse_map[item["doc_id"]] else "parse_failed"
+            else:
+                updates["parse_status"] = _infer_parse_status(
+                    absolute_path=absolute_path,
+                    filename=item.get("filename"),
+                    content_type=item.get("content_type"),
+                    download_status=inferred_download,
+                )
+        if item.get("parse_quality_flags") is None:
+            updates["parse_quality_flags"] = "[]"
+        if item.get("delta_state") is None:
+            updates["delta_state"] = _infer_delta_state(
+                status=item.get("status"),
+                download_status=inferred_download,
+                absolute_path=absolute_path,
+            )
+        if item.get("retry_count") is None:
+            updates["retry_count"] = 0
+
+        if updates:
+            fields = ", ".join(f"{key} = ?" for key in updates)
+            conn.execute(
+                f"UPDATE documents SET {fields} WHERE doc_id = ?",
+                (*updates.values(), item["doc_id"]),
+            )
     conn.commit()
 
 
@@ -703,6 +823,19 @@ def header_variants(url: str) -> list[dict]:
     return variants
 
 
+def conditional_request_headers(existing: dict | None) -> dict[str, str]:
+    if not existing:
+        return {}
+    headers: dict[str, str] = {}
+    etag = (existing.get("etag") or "").strip()
+    last_modified = (existing.get("last_modified") or "").strip()
+    if etag:
+        headers["If-None-Match"] = etag
+    if last_modified:
+        headers["If-Modified-Since"] = last_modified
+    return headers
+
+
 def url_variants(url: str) -> list[str]:
     variants = [url]
     parsed = urlparse(url)
@@ -718,6 +851,7 @@ def download_with_fallbacks(
     target_dir: Path,
     *,
     download_mode: str = "http",
+    existing: dict | None = None,
 ) -> dict:
     """
     Download a URL to a temp file in target_dir.
@@ -737,20 +871,38 @@ def download_with_fallbacks(
     last_error: str | None = None
     target_dir.mkdir(parents=True, exist_ok=True)
 
+    conditional_headers = conditional_request_headers(existing)
+
     for candidate_url in url_variants(url):
         for headers in header_variants(candidate_url):
             resp = None
             temp_path: str | None = None
             header_label = "edgar" if headers is HEADERS_EDGAR else "web"
             try:
-                resp = requests.get(candidate_url, headers=headers, stream=True, timeout=30, allow_redirects=True)
-                resp.raise_for_status()
+                request_headers = dict(headers)
+                request_headers.update(conditional_headers)
+                resp = requests.get(candidate_url, headers=request_headers, stream=True, timeout=30, allow_redirects=True)
 
-                # Capture response metadata
-                etag = resp.headers.get("ETag") or resp.headers.get("etag")
-                last_modified = resp.headers.get("Last-Modified") or resp.headers.get("last-modified")
+                etag = resp.headers.get("ETag") or resp.headers.get("etag") or (existing or {}).get("etag")
+                last_modified = resp.headers.get("Last-Modified") or resp.headers.get("last-modified") or (existing or {}).get("last_modified")
                 content_length_str = resp.headers.get("Content-Length") or resp.headers.get("content-length")
-                content_length: int | None = int(content_length_str) if content_length_str and content_length_str.isdigit() else None
+                content_length: int | None = int(content_length_str) if content_length_str and content_length_str.isdigit() else (existing or {}).get("content_length")
+
+                if resp.status_code == 304:
+                    return {
+                        "result": "not_modified",
+                        "temp_path": None,
+                        "final_url": resp.url or candidate_url,
+                        "content_type": ((existing or {}).get("content_type") or resp.headers.get("Content-Type", "").split(";")[0].strip().lower()),
+                        "content_length": content_length,
+                        "etag": etag,
+                        "last_modified": last_modified,
+                        "size_bytes": (existing or {}).get("size_bytes") or 0,
+                        "sha256": (existing or {}).get("sha256") or "",
+                        "attempts": attempts + [{"url": candidate_url, "headers": header_label, "status": resp.status_code, "result": "not_modified"}],
+                    }
+
+                resp.raise_for_status()
 
                 total = 0
                 sha = hashlib.sha256()
@@ -765,6 +917,7 @@ def download_with_fallbacks(
                         sha.update(chunk)
                         tmp.write(chunk)
                 return {
+                    "result": "downloaded",
                     "temp_path": temp_path,
                     "final_url": resp.url,
                     "content_type": resp.headers.get("Content-Type", "").split(";")[0].strip().lower(),
@@ -934,7 +1087,7 @@ def upsert_document(
     etag: str | None = None,
     last_modified: str | None = None,
     download_status: str | None = None,
-    parse_status: str = "unparsed",
+    parse_status: str | None = None,
     parse_quality_flags: list[str] | None = None,
     delta_state: str | None = None,
     failure_type: str | None = None,
@@ -948,7 +1101,14 @@ def upsert_document(
 
     # Compute download_status from legacy status if not provided
     if download_status is None:
-        download_status = status
+        download_status = _infer_download_status(status=status, absolute_path=str(stored_path) if stored_path else None)
+    if parse_status is None:
+        parse_status = _infer_parse_status(
+            absolute_path=str(stored_path) if stored_path else None,
+            filename=filename,
+            content_type=content_type,
+            download_status=download_status,
+        )
 
     if existing:
         conn.execute(
@@ -1011,10 +1171,51 @@ def upsert_document(
         return doc_id
 
 
-def mark_existing_seen(conn: sqlite3.Connection, existing: dict, run_id: str) -> None:
+def mark_existing_seen(
+    conn: sqlite3.Connection,
+    existing: dict,
+    run_id: str,
+    *,
+    etag: str | None = None,
+    last_modified: str | None = None,
+    content_length: int | None = None,
+) -> None:
+    download_status = existing.get("download_status") or _infer_download_status(
+        status=existing.get("status"),
+        absolute_path=existing.get("absolute_path"),
+    )
+    parse_status = existing.get("parse_status") or _infer_parse_status(
+        absolute_path=existing.get("absolute_path"),
+        filename=existing.get("filename"),
+        content_type=existing.get("content_type"),
+        download_status=download_status,
+    )
     conn.execute(
-        "UPDATE documents SET last_run_id = ?, last_seen_at = ?, status = ?, delta_state = ? WHERE doc_id = ?",
-        (run_id, utc_now_iso(), "existing", "unchanged", existing["doc_id"]),
+        """
+        UPDATE documents
+        SET last_run_id = ?, last_seen_at = ?, status = ?, delta_state = ?,
+            download_status = ?, parse_status = ?,
+            parse_quality_flags = COALESCE(parse_quality_flags, '[]'),
+            first_seen_at = COALESCE(first_seen_at, downloaded_at, last_seen_at, ?),
+            etag = COALESCE(?, etag),
+            last_modified = COALESCE(?, last_modified),
+            content_length = COALESCE(?, content_length),
+            retry_count = COALESCE(retry_count, 0)
+        WHERE doc_id = ?
+        """,
+        (
+            run_id,
+            utc_now_iso(),
+            "existing",
+            "unchanged",
+            download_status,
+            parse_status,
+            utc_now_iso(),
+            etag,
+            last_modified,
+            content_length,
+            existing["doc_id"],
+        ),
     )
     conn.commit()
 
@@ -1228,9 +1429,11 @@ def run_scrape(
         for idx, doc in enumerate(documents, start=1):
             update_run(conn, run_id, progress_message=f"processing {idx}/{discovered}: {doc.get('title') or doc.get('url')}")
             existing = lookup_existing_document(conn, doc.get("url") or "")
+            existing_file_present = bool(existing and existing.get("absolute_path") and Path(existing["absolute_path"]).exists())
+            has_conditional_validators = bool(existing_file_present and conditional_request_headers(existing))
 
-            # If unchanged (file exists + sha256 known), skip download
-            if existing and existing.get("absolute_path") and Path(existing["absolute_path"]).exists():
+            # Legacy fast-path when we have a file but no validators to revalidate with.
+            if existing_file_present and not has_conditional_validators:
                 skipped += 1
                 mark_existing_seen(conn, existing, run_id)
                 update_run(conn, run_id, skipped_count=skipped)
@@ -1244,7 +1447,28 @@ def run_scrape(
             # (Can be extended: look up source entry by URL domain and check download_mode)
 
             try:
-                result = download_with_fallbacks(doc["url"], family_dir, download_mode=doc_download_mode)
+                result = download_with_fallbacks(
+                    doc["url"],
+                    family_dir,
+                    download_mode=doc_download_mode,
+                    existing=existing if has_conditional_validators else None,
+                )
+
+                if result.get("result") == "not_modified":
+                    log.info("Not modified (304): %s", doc.get("url"))
+                    skipped += 1
+                    if existing:
+                        mark_existing_seen(
+                            conn,
+                            existing,
+                            run_id,
+                            etag=result.get("etag"),
+                            last_modified=result.get("last_modified"),
+                            content_length=result.get("content_length"),
+                        )
+                    update_run(conn, run_id, skipped_count=skipped)
+                    continue
+
                 new_sha256 = result["sha256"]
 
                 # Delta tracking
@@ -1261,7 +1485,14 @@ def run_scrape(
                     if os.path.exists(result["temp_path"]):
                         os.unlink(result["temp_path"])
                     skipped += 1
-                    mark_existing_seen(conn, existing, run_id)
+                    mark_existing_seen(
+                        conn,
+                        existing,
+                        run_id,
+                        etag=result.get("etag"),
+                        last_modified=result.get("last_modified"),
+                        content_length=result.get("content_length"),
+                    )
                     update_run(conn, run_id, skipped_count=skipped)
                     continue
 
@@ -1296,13 +1527,12 @@ def run_scrape(
                     etag=result.get("etag"),
                     last_modified=result.get("last_modified"),
                     download_status="downloaded",
-                    parse_status="unparsed",
                     delta_state=delta_state,
                 )
 
                 # Queue parse job for parseable content types
                 suffix = destination.suffix.lower()
-                if suffix in {".pdf", ".xlsx", ".xls"}:
+                if suffix in PARSEABLE_EXTENSIONS:
                     queue_parse_job(
                         conn,
                         doc_id=doc_id,
