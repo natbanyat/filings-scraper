@@ -180,6 +180,19 @@ async def index(_: web.Request) -> web.Response:
   .tab { padding:6px 14px; border-radius:8px; border:1px solid var(--border); cursor:pointer; font-size:13px; background:transparent; color:var(--muted); width:auto; }
   .tab.active { background:var(--accent); color:#081022; border-color:var(--accent); }
   @media(max-width:1080px) { .grid-2,.grid-3,.form-grid { grid-template-columns:1fr; } }
+  /* Artifact viewer modal */
+  .modal-overlay{display:none;position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,.82);overflow:auto;}
+  .modal-overlay.open{display:flex;align-items:flex-start;justify-content:center;padding:32px 16px;}
+  .modal-box{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:24px;max-width:960px;width:100%;position:relative;box-shadow:0 24px 64px rgba(0,0,0,.5);}
+  .modal-close{position:absolute;top:12px;right:16px;cursor:pointer;background:transparent;color:var(--muted);border:none;font-size:22px;width:auto;padding:0 8px;line-height:1;}
+  .modal-close:hover{color:var(--text);}
+  .artifact-text{white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,monospace;font-size:12px;line-height:1.6;color:var(--text);background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:16px;max-height:480px;overflow:auto;margin-top:8px;}
+  .artifact-raw{white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,monospace;font-size:11px;line-height:1.5;color:var(--muted);background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:16px;max-height:480px;overflow:auto;margin-top:8px;}
+  .chunk-block{border:1px solid var(--border);border-radius:8px;padding:12px;margin-top:8px;}
+  .chunk-block summary{cursor:pointer;color:var(--muted);font-size:12px;user-select:none;}
+  .chunk-block pre{white-space:pre-wrap;font-size:12px;font-family:ui-monospace,SFMono-Regular,monospace;margin:8px 0 0;max-height:300px;overflow:auto;}
+  .view-btn{background:transparent;color:var(--accent);border:1px solid var(--border);border-radius:6px;padding:2px 8px;font-size:11px;cursor:pointer;width:auto;display:inline-block;vertical-align:middle;}
+  .view-btn:hover{background:var(--panel-2);}
 </style>
 </head>
 <body>
@@ -304,7 +317,10 @@ async def index(_: web.Request) -> web.Response:
 
   <!-- Documents -->
   <div class="card">
-    <h2>Downloaded documents</h2>
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap;">
+      <h2 style="margin:0;">Downloaded documents</h2>
+      <input id="doc-filter" placeholder="Filter by company, title, family, or delta&#8230;" style="max-width:320px;padding:6px 10px;">
+    </div>
     <table>
       <thead>
         <tr>
@@ -318,7 +334,9 @@ async def index(_: web.Request) -> web.Response:
 
   <!-- Source registry -->
   <div class="card">
-    <h2>Source registry</h2>
+    <h2 style="display:flex;align-items:center;gap:12px;">
+      Source registry
+    </h2>
     <p class="small">Auto-bootstrapped from TICKER_META. Edit <code>scripts/official_source_registry.yaml</code> to override crawl parameters.</p>
     <table>
       <thead><tr><th>Source ID</th><th>Company</th><th>Domain</th><th>Crawl</th><th>Download</th><th>Parse profile</th><th>Priority</th><th>Enabled</th></tr></thead>
@@ -327,8 +345,17 @@ async def index(_: web.Request) -> web.Response:
   </div>
 </div>
 
+<!-- Artifact viewer modal -->
+<div class="modal-overlay" id="artifact-modal">
+  <div class="modal-box">
+    <button class="modal-close" id="modal-close-btn" title="Close">&times;</button>
+    <div id="modal-content"></div>
+  </div>
+</div>
+
 <script>
 let _allJobs = [];
+let _allDocs = [];
 let _jobFilter = '';
 
 async function fetchJSON(url, options) {
@@ -434,32 +461,8 @@ function renderSummary(data) {
   renderJobs();
 
   // Documents
-  const docsBody = document.getElementById('documents-body');
-  docsBody.innerHTML = '';
-  (data.recent_documents || []).forEach(doc => {
-    const tr = el('tr');
-    const href = doc.relative_path ? `/files/${encodeURI(doc.relative_path)}` : (doc.final_url||doc.source_url||'#');
-    const parseHref = doc.parse_artifact_relative_path ? `/files/${encodeURI(doc.parse_artifact_relative_path)}` : '';
-    const derivedHref = doc.derived_artifact_relative_path ? `/files/${encodeURI(doc.derived_artifact_relative_path)}` : '';
-    const fname = doc.filename || 'missing';
-    const delta = doc.delta_state || '';
-    const parse = doc.parse_status || '';
-    tr.innerHTML = `
-      <td><strong>${doc.company_name}</strong><br><span class="small muted">${doc.company_key}</span></td>
-      <td>${doc.doc_family||doc.doc_type||'other'}</td>
-      <td>${doc.published_at||'undated'}</td>
-      <td>${doc.title||'Untitled'}</td>
-      <td class="small">
-        <a href="${href}" target="_blank">raw: ${fname}</a><br>
-        ${doc.parse_artifact_available ? `<a href="${parseHref}" target="_blank">parse.json</a>` : '<span class="muted">parse.json —</span>'}<br>
-        ${doc.derived_artifact_available ? `<a href="${derivedHref}" target="_blank">derived.json</a>` : '<span class="muted">derived.json —</span>'}
-      </td>
-      <td><span class="pill delta-${delta}">${delta||'—'}</span></td>
-      <td><span class="pill status-${parse}">${parse||'—'}</span><br><span class="small muted">${doc.latest_parser_name||'—'} ${doc.latest_parsed_at ? '· '+formatDate(doc.latest_parsed_at) : ''}</span></td>
-      <td class="small">${doc.source||'—'}</td>
-    `;
-    docsBody.append(tr);
-  });
+  _allDocs = data.recent_documents || [];
+  renderDocs();
 }
 
 function renderJobs() {
@@ -576,6 +579,255 @@ document.getElementById('parse-form').addEventListener('submit', async (event) =
     resultBox.textContent = `Error: ${err.message}`;
   }
 });
+
+// Document filter
+function renderDocs() {
+  const q = (document.getElementById('doc-filter').value || '').toLowerCase();
+  const docs = q ? _allDocs.filter(d => {
+    return (d.company_name||'').toLowerCase().includes(q)
+        || (d.company_key||'').toLowerCase().includes(q)
+        || (d.title||'').toLowerCase().includes(q)
+        || (d.doc_family||d.doc_type||'').toLowerCase().includes(q)
+        || (d.delta_state||'').toLowerCase().includes(q);
+  }) : _allDocs;
+  const docsBody = document.getElementById('documents-body');
+  docsBody.innerHTML = '';
+  if (!docs.length) {
+    const tr = el('tr'); tr.innerHTML = '<td colspan="8" class="muted">No documents.</td>'; docsBody.append(tr); return;
+  }
+  docs.forEach(doc => {
+    const tr = el('tr');
+    const href = doc.relative_path ? `/files/${encodeURI(doc.relative_path)}` : (doc.final_url||doc.source_url||'#');
+    const parseHref = doc.parse_artifact_relative_path ? `/files/${encodeURI(doc.parse_artifact_relative_path)}` : '';
+    const derivedHref = doc.derived_artifact_relative_path ? `/files/${encodeURI(doc.derived_artifact_relative_path)}` : '';
+    const fname = doc.filename || 'missing';
+    const delta = doc.delta_state || '';
+    const parse = doc.parse_status || '';
+    tr.innerHTML = `
+      <td><strong>${doc.company_name}</strong><br><span class="small muted">${doc.company_key}</span></td>
+      <td>${doc.doc_family||doc.doc_type||'other'}</td>
+      <td>${doc.published_at||'undated'}</td>
+      <td>${doc.title||'Untitled'}</td>
+      <td class="small">
+        <a href="${href}" target="_blank">raw: ${fname}</a><br>
+        ${doc.parse_artifact_available
+          ? `<button class="view-btn" data-artifact-url="${parseHref}" data-artifact-type="parse">parse.json</button> <a href="${parseHref}" target="_blank" class="muted" title="Open raw">&#8599;</a>`
+          : '<span class="muted">parse &mdash;</span>'}<br>
+        ${doc.derived_artifact_available
+          ? `<button class="view-btn" data-artifact-url="${derivedHref}" data-artifact-type="derived">derived.json</button> <a href="${derivedHref}" target="_blank" class="muted" title="Open raw">&#8599;</a>`
+          : '<span class="muted">derived &mdash;</span>'}
+      </td>
+      <td><span class="pill delta-${delta}">${delta||'&mdash;'}</span></td>
+      <td><span class="pill status-${parse}">${parse||'&mdash;'}</span><br><span class="small muted">${doc.latest_parser_name||'&mdash;'} ${doc.latest_parsed_at ? '&middot; '+formatDate(doc.latest_parsed_at) : ''}</span></td>
+      <td class="small">${doc.source||'&mdash;'}</td>
+    `;
+    docsBody.append(tr);
+  });
+}
+
+document.getElementById('doc-filter').addEventListener('input', renderDocs);
+
+// Artifact viewer modal
+const _modal = document.getElementById('artifact-modal');
+const _modalContent = document.getElementById('modal-content');
+
+document.getElementById('modal-close-btn').addEventListener('click', () => _modal.classList.remove('open'));
+_modal.addEventListener('click', (e) => { if (e.target === _modal) _modal.classList.remove('open'); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') _modal.classList.remove('open'); });
+
+document.body.addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-artifact-url]');
+  if (!btn) return;
+  openArtifact(btn.dataset.artifactUrl, btn.dataset.artifactType);
+});
+
+async function openArtifact(url, type) {
+  _modalContent.innerHTML = '<p class="muted" style="padding:24px 0;">Loading\u2026</p>';
+  _modal.classList.add('open');
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    _modalContent.innerHTML = '';
+    _modalContent.append(buildArtifactView(data, type, url));
+  } catch (err) {
+    _modalContent.innerHTML = '<p style="color:var(--bad);">Failed to load: ' + err.message + '</p>';
+  }
+}
+
+function buildArtifactView(data, type, rawUrl) {
+  const wrap = el('div');
+  const typeLabel = type === 'parse' ? 'Parse artifact' : 'Derived artifact';
+  const hdr = el('div', {style:'display:flex;align-items:center;gap:12px;margin-bottom:16px;flex-wrap:wrap;'});
+  hdr.innerHTML = '<h2 style="margin:0;">' + typeLabel + '</h2>';
+  const rawLink = el('a', {href: rawUrl, target:'_blank', class:'pill', style:'font-size:12px;'}, 'Raw JSON \u2197');
+  hdr.append(rawLink);
+  wrap.append(hdr);
+
+  let showRaw = false;
+  const tabBar = el('div', {class:'tabs', style:'margin-bottom:12px;'});
+  const fmtBtn = el('button', {class:'tab active'}, 'Formatted');
+  const rawBtn = el('button', {class:'tab'}, 'Raw JSON');
+  tabBar.append(fmtBtn, rawBtn);
+  wrap.append(tabBar);
+
+  const area = el('div');
+  wrap.append(area);
+
+  function repaint() {
+    area.innerHTML = '';
+    if (showRaw) {
+      const pre = el('pre', {class:'artifact-raw'});
+      pre.textContent = JSON.stringify(data, null, 2);
+      area.append(pre);
+    } else {
+      if (type === 'parse') renderParseView(area, data);
+      else renderDerivedView(area, data);
+    }
+  }
+
+  fmtBtn.addEventListener('click', () => { showRaw=false; fmtBtn.classList.add('active'); rawBtn.classList.remove('active'); repaint(); });
+  rawBtn.addEventListener('click', () => { showRaw=true; rawBtn.classList.add('active'); fmtBtn.classList.remove('active'); repaint(); });
+  repaint();
+  return wrap;
+}
+
+function renderParseView(container, d) {
+  const metaRow = el('div', {style:'display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;'});
+  metaRow.append(badge(d.parser_name || 'unknown', ''));
+  (d.quality_flags || []).forEach(f => metaRow.append(badge(f, 'status-parsed')));
+  if (d.ok === false) metaRow.append(badge('failed', 'status-failed'));
+  container.append(metaRow);
+
+  if (d.error) {
+    const ep = el('p', {style:'color:var(--bad);margin-bottom:8px;'});
+    ep.textContent = 'Error: ' + d.error;
+    container.append(ep);
+  }
+
+  const md = d.metadata || {};
+  const statsWrap = el('div', {style:'display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px;'});
+  [
+    ['Pages', d.page_count != null ? d.page_count : 'N/A'],
+    ['Tables', d.table_count != null ? d.table_count : 0],
+    ['Chars', d.text ? d.text.length.toLocaleString() : 0],
+    ['Headings', (md.headings||[]).length || md.heading_count || 0],
+  ].forEach(([lbl, val]) => {
+    const s = el('div', {class:'stat'});
+    s.innerHTML = '<div class="num" style="font-size:15px;">' + val + '</div><div class="lbl">' + lbl + '</div>';
+    statsWrap.append(s);
+  });
+  container.append(statsWrap);
+
+  if (md.title || d.title) {
+    const tp = el('p', {style:'font-weight:600;margin-bottom:6px;'});
+    tp.textContent = md.title || d.title;
+    container.append(tp);
+  }
+  if (md.description) {
+    const dp = el('p', {class:'small muted', style:'margin-bottom:8px;'});
+    dp.textContent = md.description;
+    container.append(dp);
+  }
+
+  if (d.text) {
+    const hl = el('h3', {class:'small muted', style:'margin:0 0 4px;'});
+    hl.textContent = 'Extracted text (' + d.text.length.toLocaleString() + ' chars)';
+    container.append(hl);
+    const pre = el('pre', {class:'artifact-text'});
+    pre.textContent = d.text;
+    container.append(pre);
+  }
+
+  if (d.tables && d.tables.length) {
+    const hl = el('h3', {class:'small muted', style:'margin:12px 0 4px;'});
+    hl.textContent = 'Tables (' + d.tables.length + ')';
+    container.append(hl);
+    d.tables.slice(0, 5).forEach((t, i) => {
+      const det = el('details', {class:'chunk-block'});
+      det.innerHTML = '<summary>Table ' + (i+1) + (t.caption ? ' \u2014 ' + t.caption : '') + '</summary>';
+      const pre = el('pre');
+      pre.textContent = JSON.stringify(t, null, 2);
+      det.append(pre);
+      container.append(det);
+    });
+  }
+}
+
+function renderDerivedView(container, d) {
+  const delta = d.delta || {};
+  const ds = delta.status || '\u2014';
+  const deltaRow = el('div', {style:'display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px;'});
+  deltaRow.innerHTML = '<span class="small muted">Delta:</span><span class="pill delta-' + (delta.status||'') + '">' + ds + '</span>';
+  if (delta.has_prior) {
+    const pb = el('span', {class:'pill status-running', title:'A prior version exists in the corpus'}, 'has prior version');
+    deltaRow.append(pb);
+  }
+  container.append(deltaRow);
+
+  const metaRow = el('div', {style:'display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;'});
+  metaRow.append(badge(d.parser_name || 'unknown', ''));
+  (d.quality_flags || []).forEach(f => metaRow.append(badge(f, 'status-parsed')));
+  container.append(metaRow);
+
+  const summ = d.summary || {};
+  const statsWrap = el('div', {style:'display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px;'});
+  [
+    ['Chars', (d.text_chars || d.normalized_text_chars || 0).toLocaleString()],
+    ['Chunks', d.chunk_count || 0],
+    ['Tables', summ.table_count != null ? summ.table_count : 0],
+    ['Pages', summ.page_count != null ? summ.page_count : 'N/A'],
+  ].forEach(([lbl, val]) => {
+    const s = el('div', {class:'stat'});
+    s.innerHTML = '<div class="num" style="font-size:15px;">' + val + '</div><div class="lbl">' + lbl + '</div>';
+    statsWrap.append(s);
+  });
+  container.append(statsWrap);
+
+  if (summ.title) {
+    const tp = el('p', {style:'font-weight:600;margin-bottom:4px;'});
+    tp.textContent = summ.title;
+    container.append(tp);
+  }
+
+  if (summ.excerpt) {
+    const hl = el('h3', {class:'small muted', style:'margin:0 0 4px;'});
+    hl.textContent = 'Excerpt';
+    container.append(hl);
+    const pre = el('pre', {class:'artifact-text', style:'max-height:180px;'});
+    pre.textContent = summ.excerpt;
+    container.append(pre);
+  }
+
+  if (d.chunks && d.chunks.length) {
+    const hl = el('h3', {class:'small muted', style:'margin:12px 0 4px;'});
+    hl.textContent = 'Chunks (' + d.chunks.length + ')';
+    container.append(hl);
+    d.chunks.forEach(chunk => {
+      const det = el('details', {class:'chunk-block'});
+      const range = 'chars ' + (chunk.char_start||0).toLocaleString() + '\u2013' + (chunk.char_end||0).toLocaleString() + ' (' + ((chunk.char_end||0) - (chunk.char_start||0)).toLocaleString() + ' chars)';
+      det.innerHTML = '<summary>Chunk ' + chunk.chunk_index + ' \u2014 ' + range + '</summary>';
+      const pre = el('pre');
+      pre.textContent = chunk.text || '';
+      det.append(pre);
+      container.append(det);
+    });
+  }
+
+  if (d.tables_preview && d.tables_preview.length) {
+    const hl = el('h3', {class:'small muted', style:'margin:12px 0 4px;'});
+    hl.textContent = 'Tables preview (' + d.tables_preview.length + ')';
+    container.append(hl);
+    d.tables_preview.slice(0, 5).forEach((t, i) => {
+      const det = el('details', {class:'chunk-block'});
+      det.innerHTML = '<summary>Table ' + (i+1) + '</summary>';
+      const pre = el('pre');
+      pre.textContent = JSON.stringify(t, null, 2);
+      det.append(pre);
+      container.append(det);
+    });
+  }
+}
 
 refresh();
 loadRegistry();
