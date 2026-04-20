@@ -55,15 +55,34 @@ SEC_ARCHIVES_BASE = "https://www.sec.gov/Archives/edgar/data"
 IR_DOC_KEYWORDS = {
     "transcript": ["transcript", "conference call", "earnings call", "prepared remarks"],
     "presentation": ["presentation", "slide deck", "investor presentation"],
-    "results": ["quarterly results", "earnings", "results release", "financial results", "interim results"],
+    "results": [
+        "quarterly results",
+        "earnings",
+        "results release",
+        "results pack",
+        "financial results",
+        "interim results",
+        "quarterly report",
+        "half-year report",
+        "half year report",
+        "interim report",
+        "interim financial report",
+        "financial report",
+        "supplement",
+    ],
     "annual_report": ["annual report", "20-f", "10-k", "integrated report"],
     "data_pack": ["data pack", "datapack", "excel", "xlsx", "xls"],
     "webcast": ["webcast"],
-    "investor_day": ["investor day", "capital markets day", "agm"],
+    "investor_day": ["investor day", "capital markets day", "agm", "seminar", "investor education"],
 }
+
+OFFICIAL_IR_MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 DATE_PATTERNS = [
     re.compile(r"(20\d{2}-\d{2}-\d{2})"),
     re.compile(r"((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s+20\d{2})", re.I),
+    re.compile(r"(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+20\d{2})", re.I),
+    re.compile(r"((?:19|20)\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])"), # YYYYMMDD
+    re.compile(r"\b(20\d{2}[01]\d[0-3]\d)\b"), # Alternate YYYYMMDD
 ]
 QUARTER_OR_YEAR_RE = re.compile(
     r"\b(q[1-4]|fy\s?20\d{2}|20\d{2}|first quarter|second quarter|third quarter|fourth quarter|half year|interim)\b",
@@ -98,15 +117,20 @@ def _parse_date(text: str) -> str | None:
         try:
             if re.match(r"20\d{2}-\d{2}-\d{2}$", raw):
                 return raw
+            if re.match(r"(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])$", raw):
+                return f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}"
+                
             cleaned = raw.replace(",", "")
-            dt = datetime.strptime(cleaned, "%b %d %Y")
-            return dt.strftime("%Y-%m-%d")
+            
+            # Try formats
+            for fmt in ["%b %d %Y", "%B %d %Y", "%d %b %Y", "%d %B %Y"]:
+                try:
+                    dt = datetime.strptime(cleaned, fmt)
+                    return dt.strftime("%Y-%m-%d")
+                except ValueError:
+                    pass
         except ValueError:
-            try:
-                dt = datetime.strptime(cleaned, "%B %d %Y")
-                return dt.strftime("%Y-%m-%d")
-            except ValueError:
-                continue
+            pass
     return None
 
 
@@ -148,15 +172,22 @@ def _is_ir_doc_candidate(link_text: str, href: str, context: str) -> bool:
     link_text_clean = re.sub(r"\s+", " ", (link_text or "")).strip().lower()
     href_lower = (href or "").lower()
     context_lower = (context or "").lower()
-    keywords = [keyword for keywords in IR_DOC_KEYWORDS.values() for keyword in keywords]
+    combined = f"{link_text_clean} {href_lower} {context_lower}"
+    combined_norm = combined.replace("-", " ").replace("_", " ")
 
-    if link_text_clean in GENERIC_IR_LINK_TEXT and not any(keyword in href_lower for keyword in keywords):
+    # Filter out Chinese language documents
+    if any(token in combined for token in ["chinese", "zh-hk", "zh-tw", "zh-cn", "_tc.pdf", "_sc.pdf", "-chi.pdf", "_chi.pdf", "-cn.pdf", "trad_chi", "simp_chi", "繁體", "简体", "中文"]):
         return False
 
-    has_keyword = any(keyword in f"{link_text_clean} {href_lower} {context_lower}" for keyword in keywords)
+    keywords = [keyword for keywords in IR_DOC_KEYWORDS.values() for keyword in keywords]
+
+    if link_text_clean in GENERIC_IR_LINK_TEXT and not any(keyword in href_lower.replace("-", " ") for keyword in keywords):
+        return False
+
+    has_keyword = any(keyword in combined_norm for keyword in keywords)
     is_pdf = href_lower.endswith(".pdf")
     has_doc_like_href = is_pdf or href_lower.endswith((".xlsx", ".xls")) or any(token in href_lower for token in ["results", "earnings", "presentation", "transcript", "report", "webcast", "datapack", "data-pack", "agm"])
-    has_period_marker = bool(QUARTER_OR_YEAR_RE.search(f"{link_text_clean} {context_lower} {href_lower}"))
+    has_period_marker = bool(QUARTER_OR_YEAR_RE.search(combined))
 
     if is_pdf:
         return has_keyword
@@ -317,32 +348,102 @@ def fetch_ir_recent_documents(
         return []
 
     soup = BeautifulSoup(resp.text, "html.parser")
-    _, ir_host = _split_url(ir_page)
-    allowed_hosts = {ir_host} if ir_host else set()
-    seen: set[str] = set()
-    docs: list[dict] = []
+    # IR docs are often hosted on CDNs (q4cdn.com, av.sc.com), so we don't strictly bind the download host
+    allowed_hosts = None
+    
+    def _find_year_context(anchor, href, link_text, context):
+        import re
+        # First, try to extract directly from the filename or link text (strongest signal)
+        m = re.search(r'\b(19\d\d|20\d\d)\b', f"{href} {link_text}")
+        if m:
+            return m.group(1)
+            
+        for parent in anchor.parents:
+            if parent.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'div', 'section']:
+                text = parent.get_text()
+                m = re.search(r'\b(19\d\d|20\d\d)\b', text)
+                if m:
+                    return m.group(1)
+            prev = parent.find_previous_sibling(['h1', 'h2', 'h3', 'h4', 'h5'])
+            if prev:
+                m = re.search(r'\b(19\d\d|20\d\d)\b', prev.get_text())
+                if m:
+                    return m.group(1)
+        return None
 
+    candidates = []
+    
     for anchor in soup.find_all("a", href=True):
         href = anchor["href"].strip()
         link_text = " ".join(anchor.stripped_strings)
         context = " ".join(anchor.parent.stripped_strings) if anchor.parent else link_text
-        combined = f"{link_text} {href} {context}".lower()
         if not _is_ir_doc_candidate(link_text, href, context):
             continue
 
         url = href if href.startswith("http") else urljoin(ir_page, href)
+        
+        published_at = _parse_date(context) or _parse_date(link_text) or _parse_date(href)
+        fallback_year = _find_year_context(anchor, href, link_text, context)
+        
+        sort_date = "0000-00-00"
+        if published_at:
+            sort_date = published_at
+            if not _within_days(published_at, days_back):
+                continue
+        elif fallback_year:
+            sort_date = f"{fallback_year}-01-01"
+            from datetime import datetime, timezone, timedelta
+            cutoff_year = (datetime.now(timezone.utc) - timedelta(days=days_back)).year
+            if int(fallback_year) < cutoff_year:
+                continue
+        else:
+            # no date or year found, we penalize it severely in the sort but we can still try it
+            # if we don't have enough documents. Or we can reject it.
+            # Usually better to keep it if we are desperate, but sort it last.
+            sort_date = "0000-00-00"
+        
+        combined_text = f"{link_text} {context} {href}".lower().replace("-", " ").replace("_", " ")
+        doc_type = _classify_doc_type(combined_text)
+        
+        priority = 0
+        if doc_type == "annual_report": priority = 10
+        elif doc_type == "quarterly_filing": priority = 9
+        elif doc_type == "results": priority = 8
+        elif doc_type == "presentation": priority = 7
+        elif doc_type == "data_pack": priority = 6
+        elif doc_type == "transcript": priority = 5
+        
+        import re
+        m_q = re.search(r'\b(q[1-4]|first|second|third|fourth|half year)\b', combined_text)
+        if m_q:
+            priority += 0.5
+            
+        candidates.append({
+            "url": url,
+            "link_text": link_text,
+            "context": context,
+            "published_at": published_at,
+            "sort_date": sort_date,
+            "priority": priority,
+            "doc_type": doc_type
+        })
+        
+    candidates.sort(key=lambda x: (x["sort_date"], x["priority"]), reverse=True)
+
+    seen = set()
+    docs = []
+    
+    for cand in candidates:
+        url = cand["url"]
         if url in seen:
             continue
         seen.add(url)
-
-        published_at = _parse_date(context) or _parse_date(link_text) or _parse_date(href)
-        if not _within_days(published_at, days_back):
-            continue
-
+        
         try:
             data, content_type, final_url, encoding = _download_limited(
                 url,
                 headers=HEADERS_WEB,
+                max_bytes=OFFICIAL_IR_MAX_DOWNLOAD_BYTES,
                 allowed_hosts=allowed_hosts,
             )
             if "pdf" in content_type or final_url.lower().endswith(".pdf"):
@@ -364,13 +465,18 @@ def fetch_ir_recent_documents(
         ):
             continue
 
-        title = link_text or Path(final_url).name or f"IR document ({ticker_name})"
+        published_at = cand["published_at"]
+        if not published_at and cand["sort_date"] != "0000-00-00":
+            # If we only got a year context, format it as YYYY-01-01 so it doesn't show as 'undated'
+            published_at = cand["sort_date"]
+
+        title = cand["link_text"] or Path(final_url).name or f"IR document ({ticker_name})"
         docs.append({
             "title": title,
             "url": final_url,
             "source": f"IR page ({ticker_name})",
             "published_at": published_at,
-            "doc_type": _classify_doc_type(f"{link_text} {context} {final_url}"),
+            "doc_type": cand["doc_type"],
             "text_snippet": snippet,
             "origin": "ir",
             "form_type": None,
