@@ -231,7 +231,7 @@ async def index(_: web.Request) -> web.Response:
     <!-- Scrape trigger -->
     <div class="card">
       <h2>Trigger a scrape</h2>
-      <p class="small">Use a known coverage key or enter an ad hoc company. Incremental is faster; backfill for first-look deep dives.</p>
+      <p class="small">Use a known coverage key or enter an ad hoc company. Incremental is faster; backfill for first-look deep dives. New runs parse downloaded documents inline by default.</p>
       <form id="run-form" class="grid">
         <div class="form-grid">
           <label><span class="small muted">Known company</span><select id="coverage_key" name="coverage_key"></select></label>
@@ -247,7 +247,17 @@ async def index(_: web.Request) -> web.Response:
             </select>
           </label>
           <label><span class="small muted">Exchange symbol/code</span><input name="exchange_symbol" placeholder="STAN / 1299 / 8316"></label>
-          <label><span class="small muted">Days back</span><input name="days_back" placeholder="Optional integer"></label>
+          <label><span class="small muted">Time horizon</span>
+            <select name="days_back">
+              <option value="">Default (Incremental)</option>
+              <option value="90">1 Quarter (90 days)</option>
+              <option value="365">1 Year (365 days)</option>
+              <option value="1095">3 Years</option>
+              <option value="1825">5 Years</option>
+              <option value="3650">10 Years</option>
+              <option value="99999">All Time</option>
+            </select>
+          </label>
           <label><span class="small muted">Max docs</span><input name="max_docs" placeholder="Optional integer"></label>
         </div>
         <div style="display:flex;gap:12px;">
@@ -405,18 +415,35 @@ function renderSummary(data) {
   renderStatGrid('stat-jobs', ps.jobs, {pending:'status-pending',running:'status-running',completed:'status-completed',failed:'status-failed'});
 
   // Coverage dropdowns
-  const coverageOptions = data.known_companies || [];
+  const coverageOptionsMap = new Map();
+  (data.known_companies || []).forEach(c => coverageOptionsMap.set(c.coverage_key, { key: c.coverage_key, name: c.company_name }));
+  (data.companies || []).forEach(c => {
+    const key = c.coverage_key || c.company_key;
+    if (key && !coverageOptionsMap.has(key)) {
+      coverageOptionsMap.set(key, { key: key, name: c.company_name });
+    }
+  });
+  const coverageOptions = Array.from(coverageOptionsMap.values()).sort((a, b) => a.name.localeCompare(b.name));
+
   const coverage = document.getElementById('coverage_key');
   const parseCoverage = document.getElementById('parse_company_key');
+  
+  const selectedCoverage = coverage.value;
+  const selectedParse = parseCoverage.value;
+
   coverage.innerHTML = '';
   parseCoverage.innerHTML = '';
   coverage.append(el('option', {value:''}, 'Ad hoc / custom company'));
   parseCoverage.append(el('option', {value:''}, 'All companies in corpus'));
+  
   coverageOptions.forEach(item => {
-    const label = `${item.coverage_key} — ${item.company_name}`;
-    coverage.append(el('option', {value:item.coverage_key}, label));
-    parseCoverage.append(el('option', {value:item.coverage_key}, label));
+    const label = `${item.key} — ${item.name}`;
+    coverage.append(el('option', {value:item.key}, label));
+    parseCoverage.append(el('option', {value:item.key}, label));
   });
+
+  if (selectedCoverage) coverage.value = selectedCoverage;
+  if (selectedParse) parseCoverage.value = selectedParse;
 
   // Fallback list
   const fb = document.getElementById('fallback-list');
@@ -910,6 +937,8 @@ async def api_run(request: web.Request) -> web.Response:
         command.extend(["--days-back", str(payload["days_back"])])
     if payload.get("max_docs"):
         command.extend(["--max-docs", str(payload["max_docs"])])
+    if payload.get("parse", True):
+        command.append("--parse")
 
     process = subprocess.Popen(
         command,
@@ -924,7 +953,7 @@ async def api_run(request: web.Request) -> web.Response:
         "pid": process.pid,
         "company_name": company_name or TICKER_META.get(coverage_key, {}).get("company_name") or coverage_key,
         "mode": mode,
-        "message": "Run dispatched. Refresh to monitor progress.",
+        "message": "Run dispatched with inline parsing. Refresh to monitor progress.",
         "run_id": run_id,
     })
 
