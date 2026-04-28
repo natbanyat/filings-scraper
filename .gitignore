@@ -1,0 +1,39 @@
+# Secrets / local config
+.env
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# Local runtime / agent state
+.claude/
+.openclaw/
+
+# Logs and generated artifacts
+logs/
+events/
+reviews/
+*.log
+*.db
+*.sqlite
+*.sqlite3
+*.bak
+*.bak.*
+
+# Workspace-private research content
+coverage/
+memory/
+research/council-sessions/
+PORTFOLIO_CONTEXT.md
+
+# Local service/config artifacts
+scripts/channel_map.json
+
+# OS
+.DS_Store
+Thumbs.db
