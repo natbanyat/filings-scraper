@@ -1,0 +1,14 @@
+[Unit]
+Description=OpenClaw Official Docs UI Server
+After=network.target
+
+[Service]
+Type=simple
+User=natbanyat
+WorkingDirectory=/home/natbanyat/.openclaw/workspace-investing
+ExecStart=/home/natbanyat/.openclaw/workspace-investing/.venv/bin/python council_ui/official_docs_server.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
