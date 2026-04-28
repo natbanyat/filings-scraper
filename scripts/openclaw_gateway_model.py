@@ -9,10 +9,10 @@ from typing import Any, Literal
 from utils import extract_json_object
 
 
-DEFAULT_MODEL = os.environ.get("OPENCLAW_PIPELINE_MODEL", "openai/gpt-5.5")
+DEFAULT_MODEL = os.environ.get("OPENCLAW_PIPELINE_MODEL", "openai-codex/gpt-5.4")
 DEEP_MODEL = os.environ.get("OPENCLAW_PIPELINE_DEEP_MODEL", DEFAULT_MODEL)
-CHEAP_MODEL = os.environ.get("OPENCLAW_PIPELINE_CHEAP_MODEL", "openai/gpt-5.4-mini")
-PRO_MODEL = os.environ.get("OPENCLAW_PIPELINE_PRO_MODEL", "openai/gpt-5.5-pro")
+CHEAP_MODEL = os.environ.get("OPENCLAW_PIPELINE_CHEAP_MODEL", "openai-codex/gpt-5.4")
+PRO_MODEL = os.environ.get("OPENCLAW_PIPELINE_PRO_MODEL", DEFAULT_MODEL)
 DEFAULT_TIMEOUT_SEC = int(os.environ.get("OPENCLAW_PIPELINE_TIMEOUT_SEC", "180"))
 OPENCLAW_BIN = (
     os.environ.get("OPENCLAW_BIN")
