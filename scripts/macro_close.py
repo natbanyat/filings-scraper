@@ -38,14 +38,14 @@ except ImportError:
 from utils import setup_logging
 log = setup_logging("macro_close")
 
-import anthropic
 import requests
 
 from fetch_news import fetch_news, deduplicate
-from post_discord import build_embed, send_embed
+from post_discord import build_embed, send_embed, send_text
 from cache import posted_today, mark_posted
-from utils import retry, extract_json_object
+from utils import retry
 from inbox_writer import write_macro_inbox_item
+from openclaw_gateway_model import DEEP_MODEL, GatewayModelError, run_json
 
 CHANNEL_MAP_PATH = Path(__file__).parent / "channel_map.json"
 EVENTS_DIR = Path(__file__).resolve().parent.parent / "events" / "macro"
@@ -58,16 +58,6 @@ MACRO_QUERIES = [
     "gold price oil crude commodities market",
     "credit spreads investment grade high yield bonds",
 ]
-
-_client: anthropic.Anthropic | None = None
-
-
-def _get_client() -> anthropic.Anthropic:
-    global _client
-    if _client is None:
-        _client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
-    return _client
-
 
 def _load_channel_map() -> dict[str, str]:
     if not CHANNEL_MAP_PATH.exists():
@@ -98,6 +88,7 @@ ASIA_QUERIES = [
 MACRO_QUERIES = MORNING_QUERIES  # backward compat default
 
 
+@retry(max_attempts=2, backoff=5.0, exceptions=(GatewayModelError,))
 def _synthesize(articles: list[dict], today: str, mode: str = "morning") -> dict:
     """
     Use Claude Sonnet to generate a structured macro summary.
@@ -167,29 +158,10 @@ Rules:
 - risk_type: classify the dominant macro risk channel
 - If a category has no data in the headlines, write "No notable developments." for that field."""
 
-    import re
-
-    # Use streaming to keep TCP alive (WSL2 NAT drops idle connections)
-    raw_parts: list[str] = []
-    with _get_client().messages.stream(
-        model="claude-sonnet-4-6",
-        max_tokens=1536,
-        messages=[{"role": "user", "content": prompt}],
-    ) as stream:
-        for text in stream.text_stream:
-            raw_parts.append(text)
-
-    raw = "".join(raw_parts).strip()
-    json_str = extract_json_object(raw)
-    if not json_str:
-        log.warning("Macro synthesis: no JSON object returned. Raw: %.300s", raw)
-        return {"headline": "Macro summary unavailable", "themes": []}
-
-    json_str = re.sub(r",\s*([}\]])", r"\1", json_str)
     try:
-        return json.loads(json_str)
-    except json.JSONDecodeError as e:
-        log.warning("Macro synthesis: JSON parse error: %s", e)
+        return run_json(prompt, expected="object", model=os.environ.get("OPENCLAW_MACRO_MODEL") or DEEP_MODEL)
+    except GatewayModelError as e:
+        log.warning("Macro synthesis failed: %s", e)
         return {"headline": "Macro summary unavailable", "themes": []}
 
 

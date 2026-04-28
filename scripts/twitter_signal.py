@@ -2,15 +2,21 @@
 Twitter signal curation — fetches recent tweets from a curated account list,
 filters with Haiku for investing relevance, posts to #twitter-signal on Discord.
 
-Accounts are grouped into three categories (investing, news, tech) with category-
-specific filter thresholds applied inside the Haiku prompt.
+Accounts are grouped into two categories (investing, tech) with category-specific
+filter thresholds applied inside the Haiku prompt.
 
-Runs every 2 hours (06:00-22:00 HKT / 22:00-14:00 UTC). Tracks per-account
-signal density in SQLite for the weekly leaderboard.
+Schedule (HKT):
+  09:15 — Morning brief: covers 23:00 prior night → 09:15 (US overnight)
+  17:00 — Asia close: covers 09:15 → 17:00 (Asia session)
+  23:00 — End of day: covers 17:00 → 23:00 (US session open/afternoon)
+
+Each run uses an exact lookback window based on --since-ts (Unix timestamp).
+Cron passes --since-ts explicitly so each run covers exactly its window.
 
 Manual:
-  python scripts/twitter_signal.py
+  python scripts/twitter_signal.py                    # uses TWITTER_SIGNAL_LOOKBACK_HOURS fallback
   python scripts/twitter_signal.py --dry-run
+  python scripts/twitter_signal.py --since-ts 1712000000
 """
 
 import argparse
@@ -36,8 +42,6 @@ except ImportError:
 
 from utils import setup_logging
 log = setup_logging("twitter_signal")
-
-import anthropic
 import requests
 
 from config import (
@@ -53,6 +57,7 @@ from post_discord import (
 )
 from cache import upsert_twitter_stats
 from utils import retry
+from bounded_router import BoundedRoutingError, run_json_task
 
 CHANNEL_MAP_PATH = Path(__file__).parent / "channel_map.json"
 TWITTERAPI_BASE  = "https://api.twitterapi.io"
@@ -72,10 +77,6 @@ ACCOUNTS: dict[str, list[str]] = {
         "michaelxpettis", "Trinhomics", "anasalhajji", "FundamentEdge", "Geo_papic",
         "LT3000Lyall", "compound248", "DynamicMoats",
     ],
-    "news": [
-        "zerohedge", "osint613", "sentdefender", "TheTranscript_",
-        "AlphasenseInc", "tier10k", "DeItaone",
-    ],
     "tech": [
         "aakashgupta", "SemiAnalysis_", "dwarkesh_sp", "emollick", "RubenHassid",
         "AnthropicAI", "claudeai", "mstockton", "AndrewYNg", "karpathy",
@@ -85,15 +86,6 @@ ACCOUNTS: dict[str, list[str]] = {
 
 # Tag priority for selecting top N when more than MAX pass
 TAG_PRIORITY = {"BREAKING": 0, "MACRO": 1, "IDEA": 2, "INSIGHT": 3, "WISDOM": 4}
-
-_client: anthropic.Anthropic | None = None
-
-
-def _get_client() -> anthropic.Anthropic:
-    global _client
-    if _client is None:
-        _client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
-    return _client
 
 
 def _twitterapi_headers() -> dict:
@@ -149,11 +141,11 @@ def ensure_twitter_channel() -> str:
 # ── Tweet fetching ────────────────────────────────────────────────────────────
 
 @retry(max_attempts=3, backoff=2.0, exceptions=(requests.RequestException,))
-def fetch_tweets(handle: str, lookback_hours: int = TWITTER_SIGNAL_LOOKBACK_HOURS) -> list[dict]:
-    """Fetch recent tweets for a single account. Returns list of tweet dicts."""
-    since_ts = int(
-        (datetime.now(timezone.utc).timestamp()) - lookback_hours * 3600
-    )
+def fetch_tweets(handle: str, since_ts: int | None = None) -> list[dict]:
+    """Fetch recent tweets for a single account since since_ts (Unix seconds).
+    Falls back to TWITTER_SIGNAL_LOOKBACK_HOURS if since_ts is not provided."""
+    if since_ts is None:
+        since_ts = int(datetime.now(timezone.utc).timestamp()) - TWITTER_SIGNAL_LOOKBACK_HOURS * 3600
     url    = f"{TWITTERAPI_BASE}/twitter/user/last_tweets"
     params = {"userName": handle, "sinceTime": since_ts}
 
@@ -169,7 +161,7 @@ def fetch_tweets(handle: str, lookback_hours: int = TWITTER_SIGNAL_LOOKBACK_HOUR
         return []
 
     if resp.status_code == 429:
-        retry_after = int(resp.headers.get("Retry-After", 30))
+        retry_after = int(resp.headers.get("Retry-After", 5))
         log.warning("fetch_tweets(%s): 429 rate limit — sleeping %ds", handle, retry_after)
         time.sleep(retry_after + 1)
         return []
@@ -184,7 +176,9 @@ def fetch_tweets(handle: str, lookback_hours: int = TWITTER_SIGNAL_LOOKBACK_HOUR
         log.warning("fetch_tweets(%s): JSON parse error — %s", handle, e)
         return []
 
-    tweets = data.get("tweets", [])
+    tweets = data.get("data", {}).get("tweets", [])
+    if tweets is None:
+        tweets = []
     # Keep max 20, skip pure retweets (retweets with no additional comment)
     result = []
     for t in tweets[:20]:
@@ -204,7 +198,7 @@ def fetch_tweets(handle: str, lookback_hours: int = TWITTER_SIGNAL_LOOKBACK_HOUR
 
 # ── Haiku filter ──────────────────────────────────────────────────────────────
 
-@retry(max_attempts=3, backoff=5.0, exceptions=(anthropic.APIError, anthropic.APIConnectionError))
+@retry(max_attempts=3, backoff=5.0, exceptions=(BoundedRoutingError,))
 def filter_tweets_haiku(handle: str, category: str, tweets: list[dict]) -> list[dict]:
     """
     Run a single Haiku pass over one account's tweets.
@@ -220,57 +214,59 @@ def filter_tweets_haiku(handle: str, category: str, tweets: list[dict]) -> list[
         tweet_lines.append(f"[{i}] {text}")
     tweets_block = "\n".join(tweet_lines)
 
-    prompt = f"""You are an experienced buy-side investor curating a signal feed.
+    prompt = f"""You are an experienced buy-side investor curating a very high-signal daily feed.
 Account: @{handle} (category: {category})
 
-Keep only tweets that contain:
-- Breaking market news or important macro/geopolitical developments
-- Non-obvious market insights or data points
-- Actionable investing ideas or thesis-relevant observations
-- Important industry/company developments
-- Genuine investing wisdom worth remembering
+Only keep tweets that clear a HIGH bar and would be worth sending in a once-daily PM brief.
 
-Exclude:
-- Retweets of already-obvious news
-- Hot takes with no supporting data or reasoning
-- Political opinion without market relevance
-- Self-promotion, engagement bait, thread hooks ("A thread on X...")
-- Content a well-informed investor would already know
-- Generic commentary (e.g. "markets are volatile today")
+Keep only tweets that are one of:
+- Breaking market news or important macro/geopolitical developments with portfolio implications
+- Non-obvious data points or observations that could change odds on a thesis
+- Actionable investing ideas or industry/company developments that matter to valuation, KPIs, or positioning
+- Genuine mental models / investing wisdom worth saving
 
-For tech/AI accounts: only keep if it has direct investing relevance
-(model economics, AI infrastructure costs, specific company implications).
-For news accounts: higher threshold — only truly breaking or surprising developments.
+Exclude aggressively:
+- Retweets of obvious news
+- Generic market commentary or color
+- Interesting but non-actionable threads
+- AI/tech chatter without direct investing relevance
+- Hot takes without supporting data or reasoning
+- Self-promotion, engagement bait, or thread hooks
+- Content a well-informed PM would already know
+
+For tech/AI accounts: keep only if it has direct investing relevance
+(model economics, capex implications, infrastructure costs, competitive positioning, or specific company impact).
 
 Tweets:
 {tweets_block}
 
-Return ONLY a JSON array of kept tweet indices with a tag (no prose):
-[{{"index": 0, "tag": "BREAKING|MACRO|INSIGHT|IDEA|WISDOM"}}]
+Return ONLY a JSON array (no prose). For each kept tweet include:
+- index: the tweet index number
+- tag: one of BREAKING|MACRO|INSIGHT|IDEA|WISDOM
+- context: 1-2 sentences explaining why this matters to a portfolio manager (what it changes, what it affects, why it is non-obvious or timely). Be specific — name the asset class, sector, KPI, or ticker affected if clear.
+
+Important:
+- Be selective. It is better to return [] than include marginal content.
+- Prefer quality over quantity.
+- Assume only the top few tweets across all accounts will survive.
+
+Example:
+[{{"index": 0, "tag": "MACRO", "context": "Signals Fed may pause longer than priced — bearish for rate-sensitive longs, supportive for short-duration. Watch JPM/BAC NII guidance sensitivity."}}]
 
 If no tweets pass, return an empty array: []"""
 
-    raw_parts: list[str] = []
-    with _get_client().messages.stream(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=512,
-        messages=[{"role": "user", "content": prompt}],
-    ) as stream:
-        for text in stream.text_stream:
-            raw_parts.append(text)
-    raw = "".join(raw_parts).strip()
-
-    # Parse JSON array
     try:
-        start = raw.find("[")
-        end   = raw.rfind("]")
-        if start == -1 or end == -1:
-            log.debug("filter_tweets_haiku(%s): no JSON array in response", handle)
-            return []
-        kept_meta = json.loads(raw[start : end + 1])
-    except (json.JSONDecodeError, ValueError) as e:
-        log.warning("filter_tweets_haiku(%s): JSON parse error — %s", handle, e)
+        kept_meta, route = run_json_task(
+            task_class="tweet_triage",
+            prompt=prompt,
+            expected="array",
+            max_tokens=512,
+        )
+    except Exception as e:
+        log.warning("filter_tweets_haiku(%s): bounded routing failed — %s", handle, e)
         return []
+
+    log.info("filter_tweets_haiku(%s): route %s via %s", handle, route.tier, route.model)
 
     kept = []
     for item in kept_meta:
@@ -281,6 +277,7 @@ If no tweets pass, return an empty array: []"""
         if isinstance(idx, int) and 0 <= idx < len(tweets):
             tweet = dict(tweets[idx])
             tweet["_tag"] = tag
+            tweet["_context"] = item.get("context", "").strip()
             kept.append(tweet)
 
     return kept
@@ -292,15 +289,18 @@ def _format_tweet(tweet: dict, handle: str, category: str) -> str:
     """Format a single kept tweet as a plain-text Discord message."""
     tag      = tweet.get("_tag", "INSIGHT")
     text     = tweet.get("text", "").strip()
+    context  = tweet.get("_context", "").strip()
     tweet_id = tweet.get("id", "")
 
-    # Truncate text to 280 chars
+    # Truncate tweet text to 280 chars
     if len(text) > 280:
         text = text[:277] + "..."
 
     url = f"https://x.com/{handle}/status/{tweet_id}" if tweet_id else ""
 
     lines = [f"[{tag}] @{handle} ({category})", text]
+    if context:
+        lines.append(f"> {context}")
     if url:
         lines.append(url)
     return "\n".join(lines)
@@ -315,8 +315,13 @@ def _select_top(kept: list[tuple[str, str, dict]], max_count: int) -> list[tuple
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def run(dry_run: bool = False) -> None:
+def run(dry_run: bool = False, since_ts: int | None = None) -> None:
     channel_id = None if dry_run else ensure_twitter_channel()
+
+    # Log the effective window being covered
+    if since_ts is not None:
+        window_start = datetime.fromtimestamp(since_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        log.info("Coverage window: %s → now", window_start)
 
     all_kept: list[tuple[str, str, dict]] = []  # (handle, category, tweet)
 
@@ -327,11 +332,14 @@ def run(dry_run: bool = False) -> None:
             all_accounts.append((handle, category))
 
     BATCH_SIZE = 5
+    INTER_FETCH_DELAY = 8.0  # seconds between individual fetches — twitterapi.io burst limit
     for batch_start in range(0, len(all_accounts), BATCH_SIZE):
         batch = all_accounts[batch_start : batch_start + BATCH_SIZE]
-        for handle, category in batch:
+        for i, (handle, category) in enumerate(batch):
+            if i > 0:
+                time.sleep(INTER_FETCH_DELAY)
             try:
-                tweets = fetch_tweets(handle)
+                tweets = fetch_tweets(handle, since_ts=since_ts)
                 if not tweets:
                     log.debug("%s: no tweets in lookback window", handle)
                     upsert_twitter_stats(handle, category, 0, 0)
@@ -350,9 +358,9 @@ def run(dry_run: bool = False) -> None:
                 log.warning("Error processing @%s: %s — skipping", handle, e)
                 continue
 
-        # Small pause between batches to respect rate limits
+        # Pause between batches
         if batch_start + BATCH_SIZE < len(all_accounts):
-            time.sleep(1)
+            time.sleep(3)
 
     if not all_kept:
         log.info("No tweets passed filter this run.")
@@ -378,5 +386,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Twitter signal curation feed")
     parser.add_argument("--dry-run", action="store_true",
                         help="Fetch and filter but do not post to Discord")
+    parser.add_argument("--since-ts", type=int, default=None,
+                        help="Fetch tweets since this Unix timestamp (seconds). "
+                             "Overrides TWITTER_SIGNAL_LOOKBACK_HOURS. Pass from cron to "
+                             "ensure exact window coverage with no overlap or gap.")
     args = parser.parse_args()
-    run(dry_run=args.dry_run)
+    run(dry_run=args.dry_run, since_ts=args.since_ts)

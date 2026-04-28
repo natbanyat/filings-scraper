@@ -43,8 +43,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from utils import setup_logging, retry
 
 log = setup_logging("council")
-
-import anthropic
+from openclaw_gateway_model import DEEP_MODEL, GatewayModelError, run_text
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -52,41 +51,19 @@ WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
 SESSIONS_DIR   = WORKSPACE_ROOT / "research" / "council-sessions"
 PORTFOLIO_CONTEXT_PATH = WORKSPACE_ROOT / "PORTFOLIO_CONTEXT.md"
 
-MODEL = "claude-sonnet-4-6"
-
-_client: anthropic.Anthropic | None = None
-
-
-def _get_client() -> anthropic.Anthropic:
-    global _client
-    if _client is None:
-        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        if not api_key:
-            log.error("ANTHROPIC_API_KEY not set in environment / .env")
-            sys.exit(1)
-        _client = anthropic.Anthropic(api_key=api_key)
-    return _client
+MODEL = os.environ.get("OPENCLAW_COUNCIL_MODEL", DEEP_MODEL)
 
 
 # ── Streaming call ─────────────────────────────────────────────────────────────
 
-@retry(max_attempts=3, backoff=5.0, exceptions=(anthropic.APIError, anthropic.APIConnectionError))
+@retry(max_attempts=3, backoff=5.0, exceptions=(GatewayModelError,))
 def call_claude(system: str, user: str, max_tokens: int = 4096) -> str:
     """
-    Streaming call to Claude Sonnet.
-    Streaming keeps WSL2 NAT TCP connections alive.
+    Gateway-backed call for long-form council steps.
     Returns the complete text response.
     """
-    parts: list[str] = []
-    with _get_client().messages.stream(
-        model=MODEL,
-        max_tokens=max_tokens,
-        system=system,
-        messages=[{"role": "user", "content": user}],
-    ) as stream:
-        for text in stream.text_stream:
-            parts.append(text)
-    return "".join(parts).strip()
+    prompt = f"SYSTEM:\n{system}\n\nUSER:\n{user}"
+    return run_text(prompt, model=MODEL, timeout=max(240, min(900, max_tokens // 8))).strip()
 
 
 async def async_call_claude(system: str, user: str, max_tokens: int = 4096) -> str:
