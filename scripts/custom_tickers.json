@@ -1,0 +1,26 @@
+{
+    "custom/pru": {
+        "company_name": "Prudential Plc",
+        "ticker": "PRU",
+        "sec_cik": null,
+        "ir_page": "https://www.prudentialplc.com/en/investors/results-and-reports/",
+        "exchange_adapter": null,
+        "exchange_symbol": null,
+        "exchange_code": null,
+        "exchange_slug": null,
+        "website_probe_urls": [
+            "https://www.prudentialplc.com/en/investors/results-and-reports/"
+        ]
+    },
+    "custom/psix": {
+        "company_name": "Power Solutions International Inc",
+        "ticker": "PSIX",
+        "sec_cik": "1137091",
+        "ir_page": null,
+        "exchange_adapter": null,
+        "exchange_symbol": null,
+        "exchange_code": null,
+        "exchange_slug": null,
+        "website_probe_urls": []
+    }
+}
