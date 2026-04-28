@@ -1,0 +1,9 @@
+[Unit]
+Description=Drain OpenClaw official-doc parse queue
+After=network.target
+
+[Service]
+Type=oneshot
+User=natbanyat
+WorkingDirectory=/home/natbanyat/.openclaw/workspace-investing
+ExecStart=/bin/bash -lc '/home/natbanyat/.openclaw/workspace-investing/.venv/bin/python scripts/official_doc_corpus.py repair --stale-minutes 180 && /home/natbanyat/.openclaw/workspace-investing/.venv/bin/python scripts/official_doc_corpus.py parse --limit 250'

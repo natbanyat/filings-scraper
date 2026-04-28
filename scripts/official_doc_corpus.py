@@ -76,6 +76,7 @@ DEFAULT_INCREMENTAL_DAYS = 400
 DEFAULT_INCREMENTAL_MAX_DOCS = 25
 DEFAULT_BACKFILL_DAYS = 3650
 DEFAULT_BACKFILL_MAX_DOCS = 120
+DEFAULT_STALE_MINUTES = 180
 
 DOC_FAMILY_DIRS = {
     "annual_report": "annual_reports",
@@ -661,6 +662,103 @@ def get_parse_stats(root: Path) -> dict:
     }
 
 
+def repair_stale_state(
+    root: Path,
+    *,
+    stale_minutes: int = DEFAULT_STALE_MINUTES,
+    requeue_running_parse_jobs: bool = True,
+) -> dict:
+    """
+    Repair stale corpus state caused by interrupted UI/process runs.
+
+    - marks long-running scrape runs as failed
+    - optionally resets long-running parse jobs back to pending so they can be drained
+    """
+    cutoff_iso = datetime.fromtimestamp(
+        utc_now().timestamp() - max(1, stale_minutes) * 60,
+        tz=timezone.utc,
+    ).isoformat(timespec="seconds")
+    repaired_at = utc_now_iso()
+
+    summary = {
+        "stale_minutes": stale_minutes,
+        "cutoff": cutoff_iso,
+        "runs_failed": 0,
+        "run_ids": [],
+        "jobs_requeued": 0,
+        "job_ids": [],
+    }
+
+    with open_db(root) as conn:
+        stale_runs = conn.execute(
+            """
+            SELECT run_id
+            FROM runs
+            WHERE status = 'running'
+              AND COALESCE(started_at, created_at) <= ?
+            """,
+            (cutoff_iso,),
+        ).fetchall()
+        for row in stale_runs:
+            run_id = row["run_id"]
+            conn.execute(
+                """
+                UPDATE runs
+                SET status = 'failed',
+                    finished_at = ?,
+                    error_message = COALESCE(error_message, ?),
+                    progress_message = ?
+                WHERE run_id = ?
+                """,
+                (
+                    repaired_at,
+                    f"Marked failed by repair after exceeding {stale_minutes} minutes without completion.",
+                    f"stale run repaired after {stale_minutes} minutes",
+                    run_id,
+                ),
+            )
+            summary["runs_failed"] += 1
+            summary["run_ids"].append(run_id)
+
+        if requeue_running_parse_jobs:
+            stale_jobs = conn.execute(
+                """
+                SELECT job_id
+                FROM jobs
+                WHERE job_type = 'parse'
+                  AND status = 'running'
+                  AND COALESCE(started_at, created_at) <= ?
+                """,
+                (cutoff_iso,),
+            ).fetchall()
+            for row in stale_jobs:
+                job_id = row["job_id"]
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'pending',
+                        started_at = NULL,
+                        finished_at = NULL,
+                        result_json = NULL,
+                        error = ?,
+                        failure_type = 'transient',
+                        retry_count = COALESCE(retry_count, 0) + 1,
+                        retry_after = NULL
+                    WHERE job_id = ?
+                    """,
+                    (
+                        f"Re-queued by repair after exceeding {stale_minutes} minutes in running state.",
+                        job_id,
+                    ),
+                )
+                summary["jobs_requeued"] += 1
+                summary["job_ids"].append(job_id)
+
+        conn.commit()
+
+    return summary
+
+
 def get_run(root: Path, run_id: str) -> dict | None:
     with open_db(root) as conn:
         row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
@@ -707,7 +805,7 @@ def normalize_company_spec(
     folder_parts.append(slugify(name, max_len=60))
     company_folder = "_".join(part for part in folder_parts if part)
 
-    return CompanySpec(
+    spec = CompanySpec(
         company_name=name,
         ticker=ticker_final,
         coverage_key=coverage_key,
@@ -721,6 +819,26 @@ def normalize_company_spec(
         company_key=company_key,
         company_folder=company_folder,
     )
+
+    # Save to known company database if it's new
+    if company_key not in TICKER_META:
+        try:
+            from config import save_custom_ticker
+            save_custom_ticker(company_key, {
+                "company_name": name,
+                "ticker": ticker_final,
+                "sec_cik": sec_cik_final,
+                "ir_page": ir_page_final,
+                "exchange_adapter": adapter_final,
+                "exchange_symbol": symbol_final,
+                "exchange_code": code_final,
+                "exchange_slug": slug_final,
+                "website_probe_urls": spec.website_probe_urls,
+            })
+        except Exception as e:
+            log.warning("Failed to auto-save custom ticker %s: %s", company_key, e)
+
+    return spec
 
 
 # ---------------------------------------------------------------------------
@@ -785,10 +903,18 @@ def collect_candidate_documents(spec: CompanySpec, *, mode: str, days_back: int,
     elif spec.sec_cik:
         docs.extend(fetch_sec_recent_documents(spec.sec_cik, days_back=days_back, limit=max_docs))
 
+    ir_pages = []
     if spec.ir_page:
-        docs.extend(fetch_ir_recent_documents(spec.ir_page, spec.company_name, days_back=days_back, limit=max_docs))
+        ir_pages.append(spec.ir_page)
+    for p in spec.website_probe_urls:
+        if p not in ir_pages:
+            ir_pages.append(p)
+            
+    for page in ir_pages:
+        docs.extend(fetch_ir_recent_documents(page, spec.company_name, days_back=days_back, limit=max_docs))
 
     docs = dedupe_documents(docs)
+    docs.sort(key=lambda d: (d.get("published_at") or "0000-00-00", d.get("origin") == "sec"), reverse=True)
     if len(docs) > max_docs:
         docs = docs[:max_docs]
     return docs
@@ -1684,6 +1810,7 @@ def run_parse_job(
 
 def process_pending_parse_jobs(root: Path, *, limit: int = 50) -> dict:
     """Run all pending parse jobs up to limit. Returns summary dict."""
+    repair_summary = repair_stale_state(root)
     completed = failed = 0
     with open_db(root) as conn:
         jobs = conn.execute(
@@ -1697,7 +1824,12 @@ def process_pending_parse_jobs(root: Path, *, limit: int = 50) -> dict:
             except Exception as exc:
                 failed += 1
                 log.warning("Parse job %s failed: %s", job["job_id"], exc)
-    return {"completed": completed, "failed": failed, "processed": len(jobs)}
+    return {
+        "completed": completed,
+        "failed": failed,
+        "processed": len(jobs),
+        "repair": repair_summary,
+    }
 
 
 def list_parse_backfill_candidates(
@@ -1854,9 +1986,22 @@ def run_scrape(
     run_id: str | None = None,
     parse_after_download: bool = False,
 ) -> str:
+    repair_summary = repair_stale_state(root)
+    if repair_summary["runs_failed"] or repair_summary["jobs_requeued"]:
+        log.info("Pre-run repair applied: %s", repair_summary)
+
     default_days, default_max = run_defaults(mode)
     days_back = days_back or default_days
-    max_docs = max_docs or default_max
+    if not max_docs:
+        # Scale max_docs if user requests a long horizon but forgets to raise the limit
+        max_docs = default_max
+        if days_back > 365 and max_docs < 50:
+            max_docs = 50
+        if days_back > 1000 and max_docs < 120:
+            max_docs = 120
+        if days_back > 3000 and max_docs < 200:
+            max_docs = 200
+
     ensure_corpus_dirs(root)
 
     run_id = run_id or str(uuid.uuid4())
@@ -2155,7 +2300,14 @@ def parse_args() -> argparse.Namespace:
     list_jobs_parser = sub.add_parser("list-jobs", help="List job queue")
     list_jobs_parser.add_argument("--root", type=Path, default=OFFICIAL_DOC_CORPUS_DIR)
     list_jobs_parser.add_argument("--status", choices=["pending", "running", "completed", "failed"])
+    list_jobs_parser.add_argument("--job-type")
     list_jobs_parser.add_argument("--limit", type=int, default=50)
+
+    # repair
+    repair_parser = sub.add_parser("repair", help="Repair stale running runs/jobs")
+    repair_parser.add_argument("--root", type=Path, default=OFFICIAL_DOC_CORPUS_DIR)
+    repair_parser.add_argument("--stale-minutes", type=int, default=DEFAULT_STALE_MINUTES)
+    repair_parser.add_argument("--no-requeue-running-parse-jobs", action="store_true")
 
     # stats
     stats_parser = sub.add_parser("stats", help="Parse/delta state statistics")
@@ -2245,7 +2397,19 @@ def main() -> None:
         return
 
     if args.command == "list-jobs":
-        print(json.dumps(list_jobs(args.root, status=args.status, limit=args.limit), indent=2, ensure_ascii=False))
+        print(json.dumps(list_jobs(args.root, status=args.status, job_type=args.job_type, limit=args.limit), indent=2, ensure_ascii=False))
+        return
+
+    if args.command == "repair":
+        print(json.dumps(
+            repair_stale_state(
+                args.root,
+                stale_minutes=args.stale_minutes,
+                requeue_running_parse_jobs=not args.no_requeue_running_parse_jobs,
+            ),
+            indent=2,
+            ensure_ascii=False,
+        ))
         return
 
     if args.command == "stats":
