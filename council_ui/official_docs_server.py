@@ -260,6 +260,7 @@ async def index(_: web.Request) -> web.Response:
           </label>
           <label><span class="small muted">Max docs</span><input name="max_docs" placeholder="Optional integer"></label>
         </div>
+        <div id="autofill-note" class="small muted" style="min-height:18px;"></div>
         <div style="display:flex;gap:12px;">
           <button type="submit">Start scrape</button>
           <button type="button" id="refresh-btn" class="secondary">Refresh</button>
@@ -560,6 +561,72 @@ async function refresh() {
 document.getElementById('refresh-btn').addEventListener('click', () => {
   refresh();
   loadRegistry();
+});
+
+// Auto-fill metadata fields when a known company is selected. Fields stay
+// editable so the user can override (e.g. switch primary exchange before
+// running). Selecting "Ad hoc / custom company" leaves fields untouched.
+const _autofillFields = ['company_name','ticker','sec_cik','ir_page','exchange_adapter','exchange_symbol'];
+const _autofillNote = document.getElementById('autofill-note');
+
+function _setRunFormField(name, value) {
+  const el = document.querySelector('#run-form [name="' + name + '"]');
+  if (!el) return;
+  // Mark fields the user has manually edited so we don't clobber them on
+  // a re-select. Manual edits are tracked via a 'data-user-edited' flag.
+  if (el.dataset.userEdited === 'true') return;
+  el.value = value || '';
+  // Briefly highlight the field so the user sees what changed.
+  el.style.transition = 'background-color 1.2s ease';
+  el.style.backgroundColor = 'rgba(122,162,255,0.12)';
+  setTimeout(() => { el.style.backgroundColor = ''; }, 1200);
+}
+
+function _clearAutofillUserEditMarks() {
+  _autofillFields.forEach(name => {
+    const el = document.querySelector('#run-form [name="' + name + '"]');
+    if (el) delete el.dataset.userEdited;
+  });
+}
+
+// Mark a field as user-edited if they type into it after auto-fill.
+_autofillFields.forEach(name => {
+  const el = document.querySelector('#run-form [name="' + name + '"]');
+  if (!el) return;
+  el.addEventListener('input', () => { el.dataset.userEdited = 'true'; });
+  el.addEventListener('change', () => { el.dataset.userEdited = 'true'; });
+});
+
+document.getElementById('coverage_key').addEventListener('change', async (event) => {
+  const key = event.target.value;
+  if (!key) {
+    _autofillNote.textContent = '';
+    _clearAutofillUserEditMarks();
+    return;
+  }
+  // Re-selecting a company clears manual-edit marks so the auto-fill applies fresh.
+  _clearAutofillUserEditMarks();
+  _autofillNote.textContent = 'Loading metadata for ' + key + '...';
+  try {
+    const data = await fetchJSON('/api/company-metadata?coverage_key=' + encodeURIComponent(key));
+    _setRunFormField('company_name', data.company_name);
+    _setRunFormField('ticker', data.ticker);
+    _setRunFormField('sec_cik', data.sec_cik);
+    _setRunFormField('ir_page', data.ir_page);
+    _setRunFormField('exchange_adapter', data.exchange_adapter);
+    _setRunFormField('exchange_symbol', data.exchange_symbol);
+    const probeCount = (data.website_probe_urls || []).length;
+    const parts = [];
+    if (data.company_name) parts.push(data.company_name);
+    if (data.exchange_adapter) parts.push('exchange: ' + data.exchange_adapter);
+    if (data.sec_cik) parts.push('CIK: ' + data.sec_cik);
+    if (probeCount > 1) parts.push(probeCount + ' probe URLs');
+    _autofillNote.innerHTML = data.found
+      ? 'Auto-filled from registry: <strong>' + parts.join(' &middot; ') + '</strong>. Fields are editable; e.g. change exchange adapter to override primary source.'
+      : 'No registry metadata for ' + key + '. Fill in fields manually or add the entry to scripts/official_source_registry.yaml.';
+  } catch (err) {
+    _autofillNote.textContent = 'Auto-fill failed: ' + err.message;
+  }
 });
 
 document.getElementById('run-form').addEventListener('submit', async (event) => {
@@ -901,6 +968,60 @@ async def api_registry(_: web.Request) -> web.Response:
     return json_response(_registry_as_list())
 
 
+async def api_company_metadata(request: web.Request) -> web.Response:
+    """Return the canonical metadata for a single coverage key, merged from
+    TICKER_META and the source registry (whose seed_urls augment the
+    website_probe_urls list).
+
+    Used by the dashboard to auto-fill the scrape-trigger form when the
+    user selects a known company. All fields remain editable client-side
+    so the user can override (e.g. switch primary exchange before running)."""
+    coverage_key = (request.query.get("coverage_key") or "").strip()
+    if not coverage_key:
+        return json_response({"error": "coverage_key required"}, status=400)
+
+    meta = TICKER_META.get(coverage_key) or {}
+
+    probe_urls: list[str] = []
+    for u in meta.get("website_probe_urls") or []:
+        if u and u not in probe_urls:
+            probe_urls.append(u)
+    ir_page = meta.get("ir_page") or ""
+    if ir_page and ir_page not in probe_urls:
+        probe_urls.insert(0, ir_page)
+
+    # Augment with any seed_urls registered for this coverage key. The
+    # registry is the durable home for crawl-specific URLs (archive pages,
+    # sitemaps) that don't belong in TICKER_META.
+    try:
+        from official_source_registry import get_registry
+        for entry in get_registry().for_coverage_key(coverage_key):
+            for u in entry.seed_urls or []:
+                if u and u not in probe_urls:
+                    probe_urls.append(u)
+    except Exception:
+        pass
+
+    ticker_from_key = (
+        coverage_key.split("/", 1)[1]
+        if coverage_key.startswith("tickers/") else None
+    )
+
+    return json_response({
+        "coverage_key": coverage_key,
+        "company_name": meta.get("company_name") or "",
+        "ticker": meta.get("ticker") or ticker_from_key or "",
+        "sec_cik": meta.get("sec_cik") or "",
+        "ir_page": ir_page,
+        "exchange_adapter": meta.get("exchange_adapter") or "",
+        "exchange_symbol": meta.get("exchange_symbol") or meta.get("exchange_code") or "",
+        "exchange_code": meta.get("exchange_code") or "",
+        "exchange_slug": meta.get("exchange_slug") or "",
+        "website_probe_urls": probe_urls,
+        "found": bool(meta or probe_urls),
+    })
+
+
 async def api_run(request: web.Request) -> web.Response:
     payload = await request.json()
     coverage_key = payload.get("coverage_key") or None
@@ -1021,6 +1142,7 @@ def build_app() -> web.Application:
         web.get("/api/jobs", api_jobs),
         web.get("/api/parse-records", api_parse_records),
         web.get("/api/registry", api_registry),
+        web.get("/api/company-metadata", api_company_metadata),
         web.post("/api/run", api_run),
         web.post("/api/parse-backfill", api_parse_backfill),
         web.get(r"/files/{tail:.*}", file_handler),
