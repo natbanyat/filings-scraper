@@ -238,12 +238,33 @@ def _within_days(date_str: str | None, days_back: int) -> bool:
     return dt >= cutoff
 
 
+_MEDIA_EXTS = (".mp4", ".mp3", ".mov", ".avi", ".webm", ".m4v", ".m4a", ".wav", ".ogg", ".flv")
+_MEDIA_PATH_TOKENS = ("/videos/", "/video/", "/audio/", "/webcasts/", "/media/")
+
+
+def _looks_like_media_url(href_lower: str) -> bool:
+    """Reject media URLs (audio/video webcasts) before they enter the document
+    candidate pool. Surfaced from the AIA backfill: the IR scraper attempted
+    to download .mp4 files from /content/dam/group-wise/videos/... and they
+    failed under the doc-size / content-type quality filters anyway, just as
+    error noise. Filtering them at the gate avoids wasted requests and
+    misleading error counters in site_learning."""
+    if any(href_lower.endswith(ext) for ext in _MEDIA_EXTS):
+        return True
+    if any(token in href_lower for token in _MEDIA_PATH_TOKENS):
+        return True
+    return False
+
+
 def _is_ir_doc_candidate(link_text: str, href: str, context: str, ticker_name: str | None = None) -> bool:
     link_text_clean = re.sub(r"\s+", " ", (link_text or "")).strip().lower()
     href_lower = (href or "").lower()
     context_lower = (context or "").lower()
     combined = f"{link_text_clean} {href_lower} {context_lower}"
     combined_norm = _normalize_doc_text(combined)
+
+    if _looks_like_media_url(href_lower):
+        return False
 
     if _is_non_english_variant(link_text_clean, href_lower, context_lower, ticker_name):
         return False
@@ -277,56 +298,183 @@ def _is_ir_doc_candidate(link_text: str, href: str, context: str, ticker_name: s
     return has_doc_signal and has_doc_like_href and has_period_marker and len(link_text_clean) >= 10
 
 
-def _pick_edgar_document(index_json: dict, filing_url: str, form_type: str) -> tuple[str | None, str | None]:
-    if form_type in {"10-Q", "10-K", "20-F", "40-F"}:
-        return None, None
+_NOISE_TOKENS = ("index", "headers", "hdr", ".xml", ".xsd", "schema", "def.xml", "lab.xml", "pre.xml", "cal.xml")
+_RENDERER_RE = re.compile(r"^r\d+\.htm$")
+_MIN_SUBSTANTIVE_BYTES = 4096  # skip tiny exhibits (signatures, certifications)
 
-    docs = index_json.get("directory", {}).get("item", []) if "directory" in index_json else []
-    best_doc = None
-    best_label = None
-    preferred_names = ["ex99", "99", "earnings", "results", "release", "presentation", "transcript"]
 
-    for doc in docs:
-        name = doc.get("name", "")
+def _is_substantive_filename(name: str) -> bool:
+    lower = (name or "").lower()
+    if not lower or lower.endswith("/"):
+        return False
+    if any(token in lower for token in _NOISE_TOKENS):
+        return False
+    if _RENDERER_RE.match(lower):
+        return False
+    if not lower.endswith((".htm", ".html", ".txt", ".pdf")):
+        return False
+    return True
+
+
+def _iter_edgar_documents(index_json: dict, filing_url: str, form_type: str, primary_document: str | None):
+    """Yield substantive documents from a filing's index.json as
+    (absolute_url, name, description, exhibit_type, sort_score) tuples.
+
+    Yields the primary document + only those exhibits that look genuinely
+    investor-relevant (press releases, presentations, supplements,
+    transcripts, data packs). Random 10-K / 8-K agreements, opinions, and
+    schedules are skipped — they're not what an analyst pulls a corpus for,
+    and emitting them as separate entries triples the noise.
+    """
+    items = index_json.get("directory", {}).get("item", []) if "directory" in index_json else []
+    primary_lower = (primary_document or "").lower()
+    # Tokens that flag a likely substantive investor exhibit. EX-99.* in the
+    # SEC schema is "additional exhibits" — that's where companies dump
+    # press releases, presentations, supplemental data. Other ex-1, ex-5,
+    # ex-10, ex-23 etc. are legal/agreement attachments.
+    substantive_tokens = (
+        "ex99", "ex-99",
+        "earnings", "results", "release", "press",
+        "presentation", "transcript",
+        "supplement", "highlights", "data pack", "datapack", "fact book", "factbook",
+        "investor day", "capital markets",
+    )
+    # Filename patterns we treat as definitively non-substantive even if they
+    # pass the basic filter. Submission .txt dumps repeat the accession number
+    # and contain everything already represented by the parsed exhibits.
+    accession_txt_re = re.compile(r"^\d{10}-\d{2}-\d{6}\.txt$")
+
+    yielded: set[str] = set()
+    for item in items:
+        name = item.get("name", "") or ""
+        if not _is_substantive_filename(name):
+            continue
+        if accession_txt_re.match(name.lower()):
+            continue
+        size = item.get("size")
+        if isinstance(size, (int, float)) and size and size < _MIN_SUBSTANTIVE_BYTES and not name.lower().endswith(".pdf"):
+            continue
+
         lower = name.lower()
-        if not lower or lower.endswith("/"):
+        description = (item.get("description") or "").strip()
+        exhibit_type = (item.get("type") or "").strip()
+        is_primary = lower == primary_lower
+
+        # Substantive-exhibit gate: yield primary always; for non-primaries,
+        # require an investor-relevant token in the filename or a meaningful
+        # description.
+        has_substantive_token = any(token in lower for token in substantive_tokens)
+        has_meaningful_desc = bool(description) and description.lower() not in {
+            form_type.lower(), f"form {form_type.lower()}",
+        }
+        if not is_primary and not (has_substantive_token or has_meaningful_desc):
             continue
-        if any(token in lower for token in ["index", "headers", "hdr", ".xml", ".xsd", "schema", "def.xml", "lab.xml", "pre.xml"]):
-            continue
-        if re.match(r"r\d+\.htm$", lower):
-            continue
-        if not (lower.endswith(".htm") or lower.endswith(".html") or lower.endswith(".txt") or lower.endswith(".pdf")):
-            continue
+
+        # Sort score: primary first, then by description / token strength
         score = 0
+        if is_primary:
+            score += 50
+        if has_substantive_token:
+            score += 10
+        if has_meaningful_desc:
+            score += 7
+        if "ex99" in lower or "ex-99" in lower:
+            score += 5
+        if lower.endswith(".pdf"):
+            score += 3
         if lower.endswith(".txt"):
             score -= 20
-        if any(token in lower for token in preferred_names):
-            score += 10
-        if any(token in lower for token in ["exhibit", "supplement", "narrative"]):
-            score += 5
-        if form_type.lower().replace("-", "") in lower.replace("-", ""):
-            score += 3
-        if best_doc is None or score > best_doc[0]:
-            best_doc = (score, filing_url + name)
-            best_label = name
 
-    if best_doc:
-        return best_doc[1], best_label
-    return None, None
+        url = filing_url + name
+        if url in yielded:
+            continue
+        yielded.add(url)
+        yield url, name, description, exhibit_type, score
+
+
+def _classify_edgar_exhibit(
+    form_type: str,
+    name: str,
+    description: str,
+    exhibit_type: str,
+    *,
+    is_primary: bool = False,
+) -> str:
+    """Classify an EDGAR exhibit using the submissions-feed description first
+    (which is the only place SEC actually populates human-readable labels),
+    then form_type for periodic-form primaries, then filename heuristics.
+
+    is_primary=True signals this is the form's primary document (the actual
+    10-K body, the 8-K cover, etc.) — for periodic forms this collapses to
+    annual_report / quarterly_report cleanly. For non-primary exhibits we
+    DON'T blanket-label, since a 10-K's exhibit list contains schedules,
+    signatures, certifications, and supplements which need finer treatment.
+    """
+    desc_lower = (description or "").lower().strip()
+    name_lower = (name or "").lower()
+    ex_upper = (exhibit_type or "").upper()
+    form_upper = (form_type or "").upper()
+
+    # The description carries real signal when it isn't just the form name
+    is_meaningful_desc = bool(desc_lower) and desc_lower not in {
+        form_upper.lower(), f"form {form_upper.lower()}",
+    }
+    if is_meaningful_desc:
+        if "presentation" in desc_lower or "slides" in desc_lower or "deck" in desc_lower:
+            return "presentation"
+        if "transcript" in desc_lower or "conference call" in desc_lower or "earnings call" in desc_lower:
+            return "transcript"
+        if "supplement" in desc_lower or "data pack" in desc_lower or "data book" in desc_lower or "fact book" in desc_lower:
+            return "data_pack"
+        if "press release" in desc_lower or "news release" in desc_lower:
+            return "major_announcement"
+        if "annual report" in desc_lower or "integrated report" in desc_lower:
+            return "annual_report"
+        if "interim" in desc_lower or "half year" in desc_lower or "quarterly report" in desc_lower:
+            return "quarterly_report"
+
+    # Periodic-form PRIMARIES collapse cleanly: the main doc of a 10-K filing
+    # IS the annual report. Same for 10-Q / 20-F / 40-F. Only the primary —
+    # exhibits within a periodic filing are scored by their own descriptions.
+    if is_primary:
+        if form_upper in {"10-K", "20-F", "40-F"}:
+            return "annual_report"
+        if form_upper == "10-Q":
+            return "quarterly_report"
+
+    # Filename heuristic for EX-99.* presentations / data packs
+    if ex_upper.startswith("EX-99") and "presentation" in name_lower:
+        return "presentation"
+
+    return _classify_doc_type(f"{name} {description}", form_type=form_type)
 
 
 def _iter_filings_block(block: dict, cutoff_date: str):
-    """Yield (form_type, filing_date, accession_number, primary_document) tuples
-    from a single submissions block ('recent' or an archive file).
-    Filings older than cutoff_date are skipped; missing dates pass through."""
+    """Yield (form_type, filing_date, accession_number, primary_document,
+    primary_doc_description) tuples from a single submissions block ('recent'
+    or an archive file). Filings older than cutoff_date are skipped; missing
+    dates pass through.
+
+    The primary_doc_description field on the SEC submissions feed is the
+    most reliable source of human-readable doc context (e.g. "EX-99.1 PRESS
+    RELEASE", "INVESTOR PRESENTATION", "10-Q"). The per-filing index.json
+    does NOT include descriptions, so we extract them here and pass through
+    to the classifier."""
     forms = block.get("form", []) or []
     dates = block.get("filingDate", []) or []
     acc_nos = block.get("accessionNumber", []) or []
     primary_docs = block.get("primaryDocument", []) or []
-    for form_type, filed_at, acc_no, primary_document in zip(forms, dates, acc_nos, primary_docs):
+    primary_descs = block.get("primaryDocDescription", []) or []
+    n = min(len(forms), len(dates), len(acc_nos), len(primary_docs))
+    for i in range(n):
+        form_type = forms[i]
+        filed_at = dates[i]
+        acc_no = acc_nos[i]
+        primary_document = primary_docs[i]
+        primary_doc_description = primary_descs[i] if i < len(primary_descs) else ""
         if filed_at and cutoff_date and filed_at < cutoff_date:
             continue
-        yield form_type, filed_at, acc_no, primary_document
+        yield form_type, filed_at, acc_no, primary_document, primary_doc_description
 
 
 def _iter_sec_filings_meta(cik_padded: str, *, days_back: int):
@@ -395,7 +543,7 @@ def fetch_sec_recent_documents(
     cik_padded = sec_cik.lstrip("0").zfill(10)
     docs: list[dict] = []
 
-    for form_type, filed_at, acc_no, primary_document in _iter_sec_filings_meta(
+    for form_type, filed_at, acc_no, primary_document, primary_doc_description in _iter_sec_filings_meta(
         cik_padded, days_back=days_back
     ):
         if form_type not in form_types or not _within_days(filed_at, days_back):
@@ -407,53 +555,89 @@ def fetch_sec_recent_documents(
         filing_url = f"{SEC_ARCHIVES_BASE}/{cik_padded.lstrip('0')}/{acc_clean}/"
         index_url = f"{SEC_ARCHIVES_BASE}/{cik_padded.lstrip('0')}/{acc_clean}/index.json"
 
-        chosen_url = filing_url + primary_document if primary_document else None
-        chosen_name = primary_document or form_type
-
+        # Fetch the index.json once per filing so we can yield every substantive
+        # exhibit (presentation, supplement, press release) as a separate corpus
+        # entry. Falls back to primary_document only if the index isn't available.
+        idx_json: dict = {}
         try:
             idx_resp = requests.get(index_url, headers=HEADERS_EDGAR, timeout=20)
             idx_resp.raise_for_status()
             idx_json = idx_resp.json()
-            alt_url, alt_name = _pick_edgar_document(idx_json, filing_url, form_type)
-            if alt_url:
-                chosen_url, chosen_name = alt_url, alt_name or chosen_name
         except Exception as exc:
             log.debug("EDGAR index fetch failed for %s: %s", acc_no, exc)
 
-        if not chosen_url:
-            continue
+        exhibits = list(_iter_edgar_documents(idx_json, filing_url, form_type, primary_document)) if idx_json else []
+        if not exhibits and primary_document:
+            # Fallback: index.json missing or empty. Use the primary document
+            # we already have from the submissions feed.
+            exhibits = [(filing_url + primary_document, primary_document, "", form_type, 50)]
 
-        try:
-            data, content_type, final_url, encoding = _download_limited(
-                chosen_url,
-                headers=HEADERS_EDGAR,
-            )
-            lower_url = final_url.lower()
-            if "pdf" in content_type or lower_url.endswith(".pdf"):
-                text = _extract_pdf_text(data)
-            elif lower_url.endswith((".xlsx", ".xls")) or any(token in (content_type or "").lower() for token in ["spreadsheet", "excel", "officedocument.spreadsheetml"]):
-                text = f"{form_type} {chosen_name} {final_url}"
+        # Enrich the primary exhibit with the description from the submissions
+        # feed (the per-filing index.json does not carry descriptions).
+        if primary_document and primary_doc_description:
+            primary_lower = primary_document.lower()
+            enriched = []
+            for url, name, description, exhibit_type, score in exhibits:
+                if name.lower() == primary_lower and not description:
+                    enriched.append((url, name, primary_doc_description, exhibit_type, score))
+                else:
+                    enriched.append((url, name, description, exhibit_type, score))
+            exhibits = enriched
+
+        # Sort exhibits so the primary + named exhibits land first; we still
+        # honor the overall `limit` across all filings, so important docs
+        # come back even if a 10-K has a long tail of supplemental schedules.
+        exhibits.sort(key=lambda e: e[4], reverse=True)
+
+        for chosen_url, chosen_name, description, exhibit_type, _score in exhibits:
+            try:
+                data, content_type, final_url, encoding = _download_limited(
+                    chosen_url,
+                    headers=HEADERS_EDGAR,
+                )
+                lower_url = final_url.lower()
+                if "pdf" in content_type or lower_url.endswith(".pdf"):
+                    text = _extract_pdf_text(data)
+                elif lower_url.endswith((".xlsx", ".xls")) or any(token in (content_type or "").lower() for token in ["spreadsheet", "excel", "officedocument.spreadsheetml"]):
+                    text = f"{form_type} {chosen_name} {final_url}"
+                else:
+                    text = _clean_html_text(data.decode(encoding, errors="replace"))
+            except Exception as exc:
+                log.debug("EDGAR document fetch failed for %s: %s", chosen_url[:120], exc)
+                continue
+
+            snippet = _clean_snippet(text)
+            low = snippet.lower()
+            if low.startswith("sec edgar submission") or low.startswith("xml ") or "xbrl document" in low:
+                continue
+
+            # Title prefers the human-readable description (e.g. "EXHIBIT 99.1
+            # INVESTOR PRESENTATION") when EDGAR provides one; falls back to the
+            # form + filename combo otherwise.
+            if description:
+                title = f"{form_type} | {description.strip()}"
             else:
-                text = _clean_html_text(data.decode(encoding, errors="replace"))
-        except Exception as exc:
-            log.debug("EDGAR document fetch failed for %s: %s", chosen_url[:120], exc)
-            continue
+                title = f"{form_type} {chosen_name}".strip()
 
-        snippet = _clean_snippet(text)
-        low = snippet.lower()
-        if low.startswith("sec edgar submission") or low.startswith("xml ") or "xbrl document" in low:
-            continue
-        title = f"{form_type} {chosen_name}".strip()
-        docs.append({
-            "title": title,
-            "url": final_url,
-            "source": f"SEC EDGAR {form_type}",
-            "published_at": filed_at,
-            "doc_type": _classify_doc_type(f"{chosen_name} {snippet}", form_type=form_type),
-            "text_snippet": snippet,
-            "origin": "sec",
-            "form_type": form_type,
-        })
+            is_primary_doc = bool(primary_document) and chosen_name.lower() == primary_document.lower()
+            docs.append({
+                "title": title,
+                "url": final_url,
+                "source": f"SEC EDGAR {form_type}",
+                "published_at": filed_at,
+                "doc_type": _classify_edgar_exhibit(
+                    form_type, chosen_name, description, exhibit_type, is_primary=is_primary_doc
+                ),
+                "text_snippet": snippet,
+                "origin": "sec",
+                "form_type": form_type,
+                "edgar_description": description or None,
+                "edgar_exhibit_type": exhibit_type or None,
+                "is_primary_doc": is_primary_doc,
+            })
+            if len(docs) >= limit:
+                break
+
         if len(docs) >= limit:
             break
 
@@ -556,6 +740,14 @@ def fetch_ir_recent_documents(
         href = anchor["href"].strip()
         link_text = " ".join(anchor.stripped_strings)
         context = " ".join(anchor.parent.stripped_strings) if anchor.parent else link_text
+
+        # Pre-filter media URLs separately so the rejection histogram shows
+        # them as distinct from "not a doc candidate" — different fix paths.
+        if _looks_like_media_url(href.lower()):
+            if observations is not None:
+                observations["rejected_counts"]["media_url"] += 1
+            continue
+
         if not _is_ir_doc_candidate(link_text, href, context):
             if observations is not None:
                 observations["rejected_counts"]["not_a_candidate"] += 1
