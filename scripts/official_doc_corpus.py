@@ -895,13 +895,45 @@ def dedupe_documents(documents: list[dict]) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def collect_candidate_documents(spec: CompanySpec, *, mode: str, days_back: int, max_docs: int) -> list[dict]:
+def collect_candidate_documents(
+    spec: CompanySpec,
+    *,
+    mode: str,
+    days_back: int,
+    max_docs: int,
+    observations: dict | None = None,
+) -> list[dict]:
+    """
+    Collect candidate documents from every configured source for this company.
+
+    Sources are complementary, not exclusive: a name listed on HKEX with an
+    SEC ADR (e.g. HSBC) needs both HKEX and SEC discovery. The previous
+    if/elif gated SEC behind exchange_adapter and silently dropped SEC docs
+    for every dual-listed name.
+
+    When `observations` is supplied, per-source counts and IR-page rejection
+    histograms are recorded into it for site_learning persistence.
+    """
+    from official_docs_fetcher import _new_ir_observations  # late import: avoid module-load-time cycle
+
     docs: list[dict] = []
 
+    # Exchange adapter (LSE / HKEX / TSE / SEC-via-adapter). May return [] for
+    # probe-only adapters today; complementary to direct SEC fetch below.
+    exchange_count = 0
     if spec.coverage_key and spec.exchange_adapter:
-        docs.extend(fetch_exchange_documents(spec.coverage_key, days_back=days_back, limit=max_docs))
-    elif spec.sec_cik:
-        docs.extend(fetch_sec_recent_documents(spec.sec_cik, days_back=days_back, limit=max_docs))
+        exchange_docs = fetch_exchange_documents(spec.coverage_key, days_back=days_back, limit=max_docs)
+        exchange_count = len(exchange_docs)
+        docs.extend(exchange_docs)
+
+    # Direct SEC EDGAR fetch — runs whenever a CIK is configured, regardless
+    # of whether an exchange_adapter is also set. Foreign filers (HSBC, MUFG,
+    # MMYT, etc.) file 6-K / 20-F here in addition to home-exchange filings.
+    sec_count = 0
+    if spec.sec_cik:
+        sec_docs = fetch_sec_recent_documents(spec.sec_cik, days_back=days_back, limit=max_docs)
+        sec_count = len(sec_docs)
+        docs.extend(sec_docs)
 
     ir_pages = []
     if spec.ir_page:
@@ -909,14 +941,36 @@ def collect_candidate_documents(spec: CompanySpec, *, mode: str, days_back: int,
     for p in spec.website_probe_urls:
         if p not in ir_pages:
             ir_pages.append(p)
-            
-    for page in ir_pages:
-        docs.extend(fetch_ir_recent_documents(page, spec.company_name, days_back=days_back, limit=max_docs))
 
+    ir_page_obs: list[dict] = []
+    for page in ir_pages:
+        page_obs = _new_ir_observations(page) if observations is not None else None
+        ir_docs = fetch_ir_recent_documents(
+            page, spec.company_name, days_back=days_back, limit=max_docs, observations=page_obs
+        )
+        if page_obs is not None:
+            ir_page_obs.append(page_obs)
+        docs.extend(ir_docs)
+
+    pre_dedupe_count = len(docs)
     docs = dedupe_documents(docs)
     docs.sort(key=lambda d: (d.get("published_at") or "0000-00-00", d.get("origin") == "sec"), reverse=True)
+    capped = False
     if len(docs) > max_docs:
         docs = docs[:max_docs]
+        capped = True
+
+    if observations is not None:
+        observations["exchange_count"] = exchange_count
+        observations["sec_count"] = sec_count
+        observations["ir_page_observations"] = ir_page_obs
+        observations["pre_dedupe_total"] = pre_dedupe_count
+        observations["post_dedupe_total"] = len(docs) if not capped else pre_dedupe_count - (pre_dedupe_count - max_docs)
+        observations["capped_at_max_docs"] = capped
+        observations["mode"] = mode
+        observations["days_back"] = days_back
+        observations["max_docs"] = max_docs
+
     return docs
 
 
@@ -1324,7 +1378,31 @@ def download_with_fallbacks(
 # ---------------------------------------------------------------------------
 
 
-def save_site_learning(root: Path, spec: CompanySpec, documents: list[dict]) -> None:
+def _serialize_observations(observations: dict | None) -> dict | None:
+    """Convert Counter objects in run observations to plain dicts for JSON
+    serialization. Preserves nested ir_page_observations."""
+    if not observations:
+        return None
+    out = dict(observations)
+    pages = []
+    for page_obs in out.get("ir_page_observations", []) or []:
+        page_copy = dict(page_obs)
+        for key in ("rejected_counts", "accepted_doc_types", "date_source_counts"):
+            val = page_copy.get(key)
+            if val is not None:
+                page_copy[key] = dict(val)
+        pages.append(page_copy)
+    out["ir_page_observations"] = pages
+    return out
+
+
+def save_site_learning(
+    root: Path,
+    spec: CompanySpec,
+    documents: list[dict],
+    *,
+    observations: dict | None = None,
+) -> None:
     company_dir = root / spec.company_folder
     meta_dir = company_dir / META_DIRNAME
     meta_dir.mkdir(parents=True, exist_ok=True)
@@ -1350,6 +1428,8 @@ def save_site_learning(root: Path, spec: CompanySpec, documents: list[dict]) -> 
         "Sources configured as download_mode=browser can use the Playwright lane when Playwright + Chromium are installed; direct asset URLs such as PDFs still prefer HTTP when they are already addressable.",
     ]
 
+    serialized_obs = _serialize_observations(observations)
+
     payload = {
         "company": asdict(spec),
         "generated_at": utc_now_iso(),
@@ -1357,6 +1437,7 @@ def save_site_learning(root: Path, spec: CompanySpec, documents: list[dict]) -> 
         "website_probes": website_probes,
         "pattern_notes": pattern_notes,
         "fallback_notes": fallback_notes,
+        "run_observations": serialized_obs,
     }
     (meta_dir / "site_learning.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -1386,6 +1467,30 @@ def save_site_learning(root: Path, spec: CompanySpec, documents: list[dict]) -> 
     lines.extend(["", "## Recorded learnings", ""])
     for note in pattern_notes + exchange_probe.get("notes", []) + fallback_notes:
         lines.append(f"- {note}")
+
+    if serialized_obs:
+        lines.extend(["", "## Last run observations", ""])
+        lines.append(f"- Mode: `{serialized_obs.get('mode')}`, days_back: `{serialized_obs.get('days_back')}`, max_docs: `{serialized_obs.get('max_docs')}`")
+        lines.append(f"- Source counts — exchange: {serialized_obs.get('exchange_count', 0)}, sec: {serialized_obs.get('sec_count', 0)}, ir_pages: {len(serialized_obs.get('ir_page_observations') or [])}")
+        lines.append(f"- Pre-dedupe total: {serialized_obs.get('pre_dedupe_total', 0)} → post-dedupe: {serialized_obs.get('post_dedupe_total', 0)} (capped at max_docs: {serialized_obs.get('capped_at_max_docs', False)})")
+        for page_obs in serialized_obs.get("ir_page_observations") or []:
+            lines.extend(["", f"### IR page: {page_obs.get('page_url')}"])
+            lines.append(f"- Page status: `{page_obs.get('page_status')}`, links seen: {page_obs.get('links_seen')}, candidates kept: {page_obs.get('candidates_kept')}, accepted: {page_obs.get('accepted_count')}")
+            rejected = page_obs.get("rejected_counts") or {}
+            if rejected:
+                rejected_pairs = sorted(rejected.items(), key=lambda kv: kv[1], reverse=True)
+                lines.append("- Rejection reasons:")
+                for reason, count in rejected_pairs:
+                    lines.append(f"  - `{reason}`: {count}")
+            accepted_types = page_obs.get("accepted_doc_types") or {}
+            if accepted_types:
+                lines.append("- Accepted by family: " + ", ".join(f"`{k}`={v}" for k, v in sorted(accepted_types.items(), key=lambda kv: kv[1], reverse=True)))
+            date_sources = page_obs.get("date_source_counts") or {}
+            if date_sources:
+                lines.append("- Date inference source: " + ", ".join(f"`{k}`={v}" for k, v in sorted(date_sources.items(), key=lambda kv: kv[1], reverse=True)))
+            for note in page_obs.get("notes") or []:
+                lines.append(f"- {note}")
+
     lines.append("")
     (meta_dir / "site_learning.md").write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
@@ -2023,11 +2128,14 @@ def run_scrape(
     documents: list[dict] = []
 
     try:
-        documents = collect_candidate_documents(spec, mode=mode, days_back=days_back, max_docs=max_docs)
+        run_observations: dict = {}
+        documents = collect_candidate_documents(
+            spec, mode=mode, days_back=days_back, max_docs=max_docs, observations=run_observations
+        )
         discovered = len(documents)
         update_run(conn, run_id, discovered_count=discovered, progress_message=f"discovered {discovered} candidate documents")
 
-        save_site_learning(root, spec, documents)
+        save_site_learning(root, spec, documents, observations=run_observations)
 
         company_dir = root / spec.company_folder
         company_dir.mkdir(parents=True, exist_ok=True)

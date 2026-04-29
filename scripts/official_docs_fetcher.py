@@ -32,7 +32,7 @@ import logging
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import unquote, urljoin, urlparse
 
 import requests
 
@@ -100,10 +100,75 @@ GENERIC_IR_LINK_TEXT = {
     "skip to main content",
 }
 
+COMPANY_DOC_RULES = {
+    "PRU": {
+        "annual_report": re.compile(r"\b(?:ar\s?20\d{2})\b", re.I),
+        "semiannual_report": re.compile(r"\b(?:hy\s?20\d{2}\b.*\breport\b|hy\b.*\bfinancial report\b)\b", re.I),
+        "non_english_file": re.compile(r"(?:^|[-_.])(tc|sc|cn|chi|traditional|simplified|chinese)(?:[-_.]|$)", re.I)
+    }
+}
+
+NON_ENGLISH_TEXT_RE = re.compile(
+    r"\b(chinese|traditional|simplified|zh[-_ ]?(?:hk|tw|cn)|trad(?:itional)?(?: chinese)?|simp(?:lified)?(?: chinese)?)\b",
+    re.I,
+)
+
+ANNUAL_REPORT_RE = re.compile(
+    r"\b(?:annual report|latest annual report|integrated report|10-k|20-f|40-f)\b",
+    re.I,
+)
+SEMIANNUAL_REPORT_RE = re.compile(
+    r"\b(?:quarterly report|interim results|interim report|interim financial report|half year report|half year financial report|q[1-4]\b.*\breport)\b",
+    re.I,
+)
+
+def _is_english_text(text: str) -> bool:
+    if not text:
+        return True
+    cjk_count = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
+    if len(text) < 100:
+        return cjk_count < 10
+    return (cjk_count / len(text)) < 0.05
+
 
 def _clean_snippet(text: str, max_chars: int = 500) -> str:
     text = re.sub(r"\s+", " ", text or "").strip()
     return text[:max_chars]
+
+
+def _normalize_doc_text(text: str) -> str:
+    normalized = unquote(text or "").lower()
+    normalized = normalized.replace("_", " ").replace("-", " ")
+    normalized = re.sub(r"\b(hy|fy|ar|q[1-4])(20\d{2})\b", r"\1 \2", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
+def _looks_like_annual_report(text: str, ticker_name: str | None = None) -> bool:
+    normalized = _normalize_doc_text(text)
+    if ticker_name and ticker_name in COMPANY_DOC_RULES:
+        if COMPANY_DOC_RULES[ticker_name]["annual_report"].search(normalized):
+            return True
+    return bool(ANNUAL_REPORT_RE.search(normalized))
+
+
+def _looks_like_semiannual_or_quarterly_report(text: str, ticker_name: str | None = None) -> bool:
+    normalized = _normalize_doc_text(text)
+    if ticker_name and ticker_name in COMPANY_DOC_RULES:
+        if COMPANY_DOC_RULES[ticker_name]["semiannual_report"].search(normalized):
+            return True
+    return bool(SEMIANNUAL_REPORT_RE.search(normalized))
+
+
+def _is_non_english_variant(link_text: str, href: str, context: str, ticker_name: str | None = None) -> bool:
+    basename = unquote(Path(urlparse(href or "").path).name).lower()
+    text = _normalize_doc_text(f"{link_text} {context}")
+    
+    if ticker_name and ticker_name in COMPANY_DOC_RULES:
+        if COMPANY_DOC_RULES[ticker_name]["non_english_file"].search(basename):
+            return True
+            
+    return bool(NON_ENGLISH_TEXT_RE.search(text))
 
 
 def _parse_date(text: str) -> str | None:
@@ -134,8 +199,8 @@ def _parse_date(text: str) -> str | None:
     return None
 
 
-def _classify_doc_type(text: str, form_type: str | None = None) -> str:
-    hay = (text or "").lower()
+def _classify_doc_type(text: str, form_type: str | None = None, ticker_name: str | None = None) -> str:
+    hay = _normalize_doc_text(text or "")
     if form_type:
         form = form_type.upper()
         if form in {"10-K", "20-F", "40-F"}:
@@ -150,6 +215,11 @@ def _classify_doc_type(text: str, form_type: str | None = None) -> str:
             if "transcript" in hay or "conference call" in hay:
                 return "transcript"
             return "filing"
+
+    if _looks_like_annual_report(hay, ticker_name):
+        return "annual_report"
+    if _looks_like_semiannual_or_quarterly_report(hay, ticker_name):
+        return "quarterly_report"
 
     for doc_type, keywords in IR_DOC_KEYWORDS.items():
         if any(keyword in hay for keyword in keywords):
@@ -168,30 +238,43 @@ def _within_days(date_str: str | None, days_back: int) -> bool:
     return dt >= cutoff
 
 
-def _is_ir_doc_candidate(link_text: str, href: str, context: str) -> bool:
+def _is_ir_doc_candidate(link_text: str, href: str, context: str, ticker_name: str | None = None) -> bool:
     link_text_clean = re.sub(r"\s+", " ", (link_text or "")).strip().lower()
     href_lower = (href or "").lower()
     context_lower = (context or "").lower()
     combined = f"{link_text_clean} {href_lower} {context_lower}"
-    combined_norm = combined.replace("-", " ").replace("_", " ")
+    combined_norm = _normalize_doc_text(combined)
 
-    # Filter out Chinese language documents
-    if any(token in combined for token in ["chinese", "zh-hk", "zh-tw", "zh-cn", "_tc.pdf", "_sc.pdf", "-chi.pdf", "_chi.pdf", "-cn.pdf", "trad_chi", "simp_chi", "繁體", "简体", "中文"]):
+    if _is_non_english_variant(link_text_clean, href_lower, context_lower, ticker_name):
         return False
 
     keywords = [keyword for keywords in IR_DOC_KEYWORDS.values() for keyword in keywords]
+    has_keyword = any(keyword in combined_norm for keyword in keywords)
+    has_report_signal = _looks_like_annual_report(combined_norm, ticker_name) or _looks_like_semiannual_or_quarterly_report(combined_norm, ticker_name)
+    filing_forms = ["10-k", "10-q", "8-k", "6-k", "20-f", "40-f", "s-1", "s-3", "f-1", "f-3"]
+    has_filing_signal = any(token in combined_norm for token in filing_forms) or "form " in combined_norm
+    has_doc_signal = has_keyword or has_report_signal or has_filing_signal
 
-    if link_text_clean in GENERIC_IR_LINK_TEXT and not any(keyword in href_lower.replace("-", " ") for keyword in keywords):
+    if link_text_clean in GENERIC_IR_LINK_TEXT and not has_doc_signal:
         return False
 
-    has_keyword = any(keyword in combined_norm for keyword in keywords)
     is_pdf = href_lower.endswith(".pdf")
-    has_doc_like_href = is_pdf or href_lower.endswith((".xlsx", ".xls")) or any(token in href_lower for token in ["results", "earnings", "presentation", "transcript", "report", "webcast", "datapack", "data-pack", "agm"])
-    has_period_marker = bool(QUARTER_OR_YEAR_RE.search(combined))
+    has_spreadsheet_ext = href_lower.endswith((".xlsx", ".xls"))
+    has_html_doc_ext = href_lower.endswith((".htm", ".html", ".txt"))
+    has_doc_like_href = is_pdf or has_spreadsheet_ext or has_html_doc_ext or any(token in href_lower for token in ["results", "earnings", "presentation", "transcript", "report", "webcast", "datapack", "data-pack", "agm"])
+    has_sec_or_archive_path = any(token in href_lower for token in ["sec-filings", "/content/", "edgar/data", "sec.gov/archives"])
+    has_period_marker = bool(QUARTER_OR_YEAR_RE.search(combined_norm)) or bool(re.search(r"\b(?:ar|hy|fy)\s?20\d{2}\b", combined_norm))
 
-    if is_pdf:
-        return has_keyword
-    return has_keyword and has_doc_like_href and has_period_marker and len(link_text_clean) >= 10
+    if is_pdf or has_spreadsheet_ext:
+        return has_doc_signal
+
+    if has_html_doc_ext and has_filing_signal:
+        return True
+
+    if has_sec_or_archive_path and has_filing_signal:
+        return True
+
+    return has_doc_signal and has_doc_like_href and has_period_marker and len(link_text_clean) >= 10
 
 
 def _pick_edgar_document(index_json: dict, filing_url: str, form_type: str) -> tuple[str | None, str | None]:
@@ -232,6 +315,73 @@ def _pick_edgar_document(index_json: dict, filing_url: str, form_type: str) -> t
     return None, None
 
 
+def _iter_filings_block(block: dict, cutoff_date: str):
+    """Yield (form_type, filing_date, accession_number, primary_document) tuples
+    from a single submissions block ('recent' or an archive file).
+    Filings older than cutoff_date are skipped; missing dates pass through."""
+    forms = block.get("form", []) or []
+    dates = block.get("filingDate", []) or []
+    acc_nos = block.get("accessionNumber", []) or []
+    primary_docs = block.get("primaryDocument", []) or []
+    for form_type, filed_at, acc_no, primary_document in zip(forms, dates, acc_nos, primary_docs):
+        if filed_at and cutoff_date and filed_at < cutoff_date:
+            continue
+        yield form_type, filed_at, acc_no, primary_document
+
+
+def _iter_sec_filings_meta(cik_padded: str, *, days_back: int):
+    """Yield filing metadata tuples spanning all available history within
+    days_back, paginating through both the 'recent' block and any older
+    'files[]' submission archives.
+
+    EDGAR caps the 'recent' block at ~1000 filings (1MB JSON). Active filers
+    (banks, foreign filers with monthly 6-K cadence, large accelerated filers)
+    routinely exceed that within 1-2 years. Older history lives in
+    submissions/CIK{cik}-submissions-{n}.json archives surfaced via the
+    'files' array on the main JSON.
+    """
+    try:
+        resp = requests.get(
+            f"{EDGAR_BASE}/submissions/CIK{cik_padded}.json",
+            headers=HEADERS_EDGAR,
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        log.warning("EDGAR submissions index fetch failed for CIK %s: %s", cik_padded, exc)
+        return
+
+    cutoff_date = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%d") if days_back else ""
+
+    # 1. Recent block (most recent ~1000 filings)
+    recent = data.get("filings", {}).get("recent", {})
+    yield from _iter_filings_block(recent, cutoff_date)
+
+    # 2. Older archive files. Each archive entry has 'name', 'filingFrom',
+    #    'filingTo'. Skip archives whose entire window predates our cutoff.
+    archives = data.get("filings", {}).get("files", []) or []
+    for archive in archives:
+        archive_to = archive.get("filingTo") or ""
+        if cutoff_date and archive_to and archive_to < cutoff_date:
+            continue
+        archive_name = archive.get("name") or ""
+        if not archive_name:
+            continue
+        try:
+            arch_resp = requests.get(
+                f"{EDGAR_BASE}/submissions/{archive_name}",
+                headers=HEADERS_EDGAR,
+                timeout=20,
+            )
+            arch_resp.raise_for_status()
+            arch_data = arch_resp.json()
+        except Exception as exc:
+            log.debug("EDGAR archive fetch failed for %s: %s", archive_name, exc)
+            continue
+        yield from _iter_filings_block(arch_data, cutoff_date)
+
+
 def fetch_sec_recent_documents(
     sec_cik: str,
     *,
@@ -243,31 +393,17 @@ def fetch_sec_recent_documents(
         return []
 
     cik_padded = sec_cik.lstrip("0").zfill(10)
-    try:
-        resp = requests.get(
-            f"{EDGAR_BASE}/submissions/CIK{cik_padded}.json",
-            headers=HEADERS_EDGAR,
-            timeout=20,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as exc:
-        log.warning("EDGAR submissions fetch failed for CIK %s: %s", sec_cik, exc)
-        return []
-
-    recent = data.get("filings", {}).get("recent", {})
-    forms = recent.get("form", [])
-    dates = recent.get("filingDate", [])
-    acc_nos = recent.get("accessionNumber", [])
-    primary_docs = recent.get("primaryDocument", [])
-
     docs: list[dict] = []
 
-    for form_type, filed_at, acc_no, primary_document in zip(forms, dates, acc_nos, primary_docs):
+    for form_type, filed_at, acc_no, primary_document in _iter_sec_filings_meta(
+        cik_padded, days_back=days_back
+    ):
         if form_type not in form_types or not _within_days(filed_at, days_back):
             continue
 
-        acc_clean = acc_no.replace("-", "")
+        acc_clean = (acc_no or "").replace("-", "")
+        if not acc_clean:
+            continue
         filing_url = f"{SEC_ARCHIVES_BASE}/{cik_padded.lstrip('0')}/{acc_clean}/"
         index_url = f"{SEC_ARCHIVES_BASE}/{cik_padded.lstrip('0')}/{acc_clean}/index.json"
 
@@ -324,13 +460,42 @@ def fetch_sec_recent_documents(
     return docs
 
 
+def _new_ir_observations(ir_page: str) -> dict:
+    """Initialise an IR-scrape observations record. Mutated in place by
+    fetch_ir_recent_documents. Persisted to <company>/_meta/site_learning.json
+    so the next run can see what worked and what didn't on this IR page."""
+    from collections import Counter
+    return {
+        "page_url": ir_page,
+        "fetched_at": None,
+        "page_status": None,
+        "links_seen": 0,
+        "candidates_kept": 0,
+        "accepted_count": 0,
+        "rejected_counts": Counter(),
+        "accepted_doc_types": Counter(),
+        "date_source_counts": Counter(),
+        "patterns_observed": [],
+        "notes": [],
+    }
+
+
 def fetch_ir_recent_documents(
     ir_page: str,
     ticker_name: str,
     *,
     days_back: int = 180,
     limit: int = 6,
+    observations: dict | None = None,
 ) -> list[dict]:
+    """Discover IR documents on a single landing/archive page.
+
+    When `observations` is supplied (a dict produced by _new_ir_observations),
+    rejection reasons, accepted document types, and date-extraction sources
+    are recorded into it. The corpus orchestrator persists this back to the
+    company's _meta/site_learning.json so future runs can diagnose recall
+    gaps without rerunning the scrape.
+    """
     if not ir_page:
         return []
 
@@ -338,13 +503,23 @@ def fetch_ir_recent_documents(
         from bs4 import BeautifulSoup
     except ImportError:
         log.warning("beautifulsoup4 not installed, skipping IR scrape")
+        if observations is not None:
+            observations["notes"].append("skipped: beautifulsoup4 not installed")
         return []
+
+    if observations is not None:
+        observations["fetched_at"] = datetime.now(timezone.utc).isoformat()
 
     try:
         resp = requests.get(ir_page, headers=HEADERS_WEB, timeout=20)
+        if observations is not None:
+            observations["page_status"] = resp.status_code
         resp.raise_for_status()
     except Exception as exc:
         log.warning("IR page fetch failed for %s: %s", ir_page, exc)
+        if observations is not None:
+            observations["rejected_counts"]["ir_page_fetch_failed"] += 1
+            observations["notes"].append(f"ir_page_fetch_failed: {exc}")
         return []
 
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -372,29 +547,55 @@ def fetch_ir_recent_documents(
         return None
 
     candidates = []
-    
-    for anchor in soup.find_all("a", href=True):
+
+    all_anchors = soup.find_all("a", href=True)
+    if observations is not None:
+        observations["links_seen"] = len(all_anchors)
+
+    for anchor in all_anchors:
         href = anchor["href"].strip()
         link_text = " ".join(anchor.stripped_strings)
         context = " ".join(anchor.parent.stripped_strings) if anchor.parent else link_text
         if not _is_ir_doc_candidate(link_text, href, context):
+            if observations is not None:
+                observations["rejected_counts"]["not_a_candidate"] += 1
             continue
 
         url = href if href.startswith("http") else urljoin(ir_page, href)
-        
-        published_at = _parse_date(context) or _parse_date(link_text) or _parse_date(href)
+
+        # Track which signal source produced the date — useful for diagnosing
+        # IR pages where date inference is unreliable.
+        date_from_context = _parse_date(context)
+        date_from_link = _parse_date(link_text) if not date_from_context else None
+        date_from_href = _parse_date(href) if not (date_from_context or date_from_link) else None
+        published_at = date_from_context or date_from_link or date_from_href
         fallback_year = _find_year_context(anchor, href, link_text, context)
-        
+
+        if observations is not None:
+            if date_from_context:
+                observations["date_source_counts"]["context"] += 1
+            elif date_from_link:
+                observations["date_source_counts"]["link_text"] += 1
+            elif date_from_href:
+                observations["date_source_counts"]["href"] += 1
+            elif fallback_year:
+                observations["date_source_counts"]["fallback_year"] += 1
+            else:
+                observations["date_source_counts"]["none"] += 1
+
         sort_date = "0000-00-00"
         if published_at:
             sort_date = published_at
             if not _within_days(published_at, days_back):
+                if observations is not None:
+                    observations["rejected_counts"]["outside_window_dated"] += 1
                 continue
         elif fallback_year:
             sort_date = f"{fallback_year}-01-01"
-            from datetime import datetime, timezone, timedelta
             cutoff_year = (datetime.now(timezone.utc) - timedelta(days=days_back)).year
             if int(fallback_year) < cutoff_year:
+                if observations is not None:
+                    observations["rejected_counts"]["outside_window_year_only"] += 1
                 continue
         else:
             # no date or year found, we penalize it severely in the sort but we can still try it
@@ -402,12 +603,12 @@ def fetch_ir_recent_documents(
             # Usually better to keep it if we are desperate, but sort it last.
             sort_date = "0000-00-00"
         
-        combined_text = f"{link_text} {context} {href}".lower().replace("-", " ").replace("_", " ")
+        combined_text = _normalize_doc_text(f"{link_text} {context} {href}")
         doc_type = _classify_doc_type(combined_text)
-        
+
         priority = 0
         if doc_type == "annual_report": priority = 10
-        elif doc_type == "quarterly_filing": priority = 9
+        elif doc_type in {"quarterly_report", "quarterly_filing"}: priority = 9
         elif doc_type == "results": priority = 8
         elif doc_type == "presentation": priority = 7
         elif doc_type == "data_pack": priority = 6
@@ -427,50 +628,72 @@ def fetch_ir_recent_documents(
             "priority": priority,
             "doc_type": doc_type
         })
-        
+
+    if observations is not None:
+        observations["candidates_kept"] = len(candidates)
+
     candidates.sort(key=lambda x: (x["sort_date"], x["priority"]), reverse=True)
 
     seen = set()
     docs = []
-    
+
     for cand in candidates:
         url = cand["url"]
         if url in seen:
+            if observations is not None:
+                observations["rejected_counts"]["duplicate_url_in_page"] += 1
             continue
         seen.add(url)
-        
-        try:
-            data, content_type, final_url, encoding = _download_limited(
-                url,
-                headers=HEADERS_WEB,
-                max_bytes=OFFICIAL_IR_MAX_DOWNLOAD_BYTES,
-                allowed_hosts=allowed_hosts,
-            )
-            if "pdf" in content_type or final_url.lower().endswith(".pdf"):
-                text = _extract_pdf_text(data)
-            else:
-                text = _clean_html_text(data.decode(encoding, errors="replace"))
-        except Exception as exc:
-            log.debug("IR linked doc rejected/fetch failed for %s: %s", url[:120], exc)
-            continue
 
-        snippet = _clean_snippet(text)
-        low = snippet.lower()
-        if (
-            len(snippet) < 80
-            or low.startswith(("function ", "var ", "window."))
-            or "optanonwrapper" in low
-            or "createelement('script')" in low
-            or "tealium" in low
-        ):
-            continue
+        final_url = url
+        lower_url = url.lower()
+        lightweight_link = (
+            lower_url.endswith((".pdf", ".htm", ".html", ".txt", ".xls", ".xlsx"))
+            or any(token in lower_url for token in ["/content/", "sec.gov/archives", "edgar/data", "/download/"])
+        )
+
+        if lightweight_link:
+            snippet = _clean_snippet(f"{cand['link_text']} {cand['context']}")
+        else:
+            try:
+                data, content_type, final_url, encoding = _download_limited(
+                    url,
+                    headers=HEADERS_WEB,
+                    max_bytes=OFFICIAL_IR_MAX_DOWNLOAD_BYTES,
+                    allowed_hosts=allowed_hosts,
+                )
+                if "pdf" in content_type or final_url.lower().endswith(".pdf"):
+                    text = _extract_pdf_text(data)
+                else:
+                    text = _clean_html_text(data.decode(encoding, errors="replace"))
+            except Exception as exc:
+                log.debug("IR linked doc rejected/fetch failed for %s: %s", url[:120], exc)
+                if observations is not None:
+                    observations["rejected_counts"]["download_failed"] += 1
+                continue
+
+            snippet = _clean_snippet(text)
+            low = snippet.lower()
+            if (
+                len(snippet) < 80
+                or low.startswith(("function ", "var ", "window."))
+                or "optanonwrapper" in low
+                or "createelement('script')" in low
+                or "tealium" in low
+            ):
+                if observations is not None:
+                    observations["rejected_counts"]["low_quality_snippet"] += 1
+                continue
 
         published_at = cand["published_at"]
         if not published_at and cand["sort_date"] != "0000-00-00":
             # If we only got a year context, format it as YYYY-01-01 so it doesn't show as 'undated'
             published_at = cand["sort_date"]
 
-        title = cand["link_text"] or Path(final_url).name or f"IR document ({ticker_name})"
+        title = cand["link_text"]
+        if not title or title.strip().lower() in GENERIC_IR_LINK_TEXT:
+            title = unquote(Path(urlparse(final_url).path).name) or Path(final_url).name
+        title = title or f"IR document ({ticker_name})"
         docs.append({
             "title": title,
             "url": final_url,
@@ -481,8 +704,37 @@ def fetch_ir_recent_documents(
             "origin": "ir",
             "form_type": None,
         })
+        if observations is not None:
+            observations["accepted_doc_types"][cand["doc_type"] or "unknown"] += 1
         if len(docs) >= limit:
             break
+
+    if observations is not None:
+        observations["accepted_count"] = len(docs)
+        # Surface a few high-signal observations the next run can act on.
+        rejected = observations["rejected_counts"]
+        notes = observations["notes"]
+        if observations["candidates_kept"] == 0 and observations["links_seen"] > 50:
+            notes.append(
+                f"WARN: {observations['links_seen']} links on page but 0 passed _is_ir_doc_candidate — "
+                "page is likely JS-rendered or document links sit behind a non-anchor element. Consider download_mode=browser."
+            )
+        if rejected.get("download_failed", 0) > max(3, observations["candidates_kept"] * 0.3):
+            notes.append(
+                f"WARN: {rejected['download_failed']} download failures of {observations['candidates_kept']} candidates "
+                "— host may rate-limit or require a browser-quality session."
+            )
+        if observations["date_source_counts"].get("none", 0) > observations["candidates_kept"] * 0.5 \
+                and observations["candidates_kept"] > 4:
+            notes.append(
+                "WARN: >50% of candidates had no date/year signal. Date inference is shallow on this page; "
+                "extend _parse_date patterns or add a page-specific extractor."
+            )
+        if observations["accepted_count"] == 0 and observations["candidates_kept"] > 0:
+            notes.append(
+                f"WARN: {observations['candidates_kept']} candidates but 0 accepted — "
+                "all rejected at download/quality stage. Check rejected_counts for the dominant reason."
+            )
 
     return docs
 
@@ -512,7 +764,18 @@ def fetch_official_documents(
     name = coverage_key.split("/")[-1]
     docs = []
     docs.extend(fetch_sec_recent_documents(meta.get("sec_cik"), days_back=days_back, limit=limit))
-    docs.extend(fetch_ir_recent_documents(meta.get("ir_page"), name, days_back=days_back, limit=limit))
+
+    ir_pages = []
+    ir_page = meta.get("ir_page")
+    if ir_page:
+        ir_pages.append(ir_page)
+    for page in meta.get("website_probe_urls") or []:
+        if page and page not in ir_pages:
+            ir_pages.append(page)
+
+    for page in ir_pages:
+        docs.extend(fetch_ir_recent_documents(page, name, days_back=days_back, limit=limit))
+
     docs = _deduplicate_documents(docs)
     docs.sort(key=lambda d: (d.get("published_at") or "", d.get("origin") == "sec"), reverse=True)
     return docs[:limit]
