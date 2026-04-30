@@ -24,7 +24,7 @@ unauthenticated scraper on the network.
 | 3. Default bind 0.0.0.0 + Tailscale install | 🟡 In progress | `phase3-bind-tailscale` |
 | 4. Cloudflare Tunnel for cloud Cowork | ✅ Landed | `phase4-cloudflared` |
 | 5. NSSM auto-start + power settings | ✅ Landed | `phase5-nssm` |
-| 6. Healthcheck + DEPLOYMENT.md rewrite + Notion | ⬜ Pending | `phase6-cleanup` |
+| 6. Healthcheck + config.py env override + Notion | ✅ Landed | `phase6-cleanup` |
 
 ---
 
@@ -236,12 +236,37 @@ curl -s -H "Authorization: Bearer $TOKEN" https://filings.<user-domain>.com/api/
 
 ---
 
-## Phase 6 — Cleanup + observability (pending)
+## Phase 6 — Cleanup + observability
 
-- `scripts/healthcheck.sh` — service / tunnel / tailnet status one-liner.
-- Daily Task Scheduler health check email.
-- DEPLOYMENT.md rewrite to consolidate.
-- Notion architecture page update.
+**Code (already landed):**
+
+- `scripts/healthcheck.sh` — five-probe daily check: service /health, auth enforcement, token round-trip, Tailscale status, last-run timestamp. Exit 0 = all green; non-zero = failure (use as the "email on failure" signal).
+- `scripts/config.py` — `OFFICIAL_DOC_CORPUS_DIR`, `INBOX_DIR`, `OFFICIAL_DOC_CORPUS_WINDOWS_DIR` now read from env first, fall back to existing defaults. Lets future hosts (MBP, Linux mini-PC) point at host-local paths without code edits.
+
+**Operator steps:**
+
+1. Schedule the health check to run daily. Inside Windows Task Scheduler:
+   ```
+   Action: wsl.exe -d Ubuntu-24.04 -u natbanyat -- bash -lc \
+     '~/.openclaw/workspace-investing/scripts/healthcheck.sh > /tmp/healthcheck.log 2>&1'
+   Trigger: Daily at 06:00
+   On failure: send email (reuse existing email pipeline, e.g. PowerShell Send-MailMessage or scripts/email_alert.py).
+   ```
+2. Verify the check works manually first:
+   ```bash
+   wsl -- bash -c '~/.openclaw/workspace-investing/scripts/healthcheck.sh'
+   ```
+   Expected output (after Phase 5 deploy):
+   ```
+   [OK]   service /health           -> 200
+   [OK]   auth enforced (no token)  -> 401
+   [OK]   /api/companies (token)    -> 200
+   [OK]   tailnet up                -> openclaw-wsl
+   [OK]   last run finished_at      -> 2026-...
+   OVERALL: PASS
+   ```
+
+**Notion architecture page** updated to show the deployed topology with the three reachability paths and the env vars each client uses. See `https://app.notion.com/p/32d7500ccde58167a5f2f99d19e8df73`.
 
 ---
 

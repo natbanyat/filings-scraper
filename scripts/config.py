@@ -5,13 +5,30 @@ Maps coverage folder keys to Discord channels, market close windows,
 and Brave Search queries.
 """
 
+import os
 from pathlib import Path
 
 WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
 COVERAGE_ROOT = WORKSPACE_ROOT / "coverage"
-INBOX_DIR = Path("/mnt/c/Users/natba/OneDrive/@ Cowork/investing/inbox")
-OFFICIAL_DOC_CORPUS_DIR = Path("/mnt/c/Users/natba/OneDrive/@ Cowork/openclaw-investing-context")
-OFFICIAL_DOC_CORPUS_WINDOWS_DIR = r"C:\Users\natba\OneDrive\@ Cowork\openclaw-investing-context"
+INBOX_DIR = Path(
+    os.environ.get(
+        "INVESTING_INBOX_DIR",
+        "/mnt/c/Users/natba/OneDrive/@ Cowork/investing/inbox",
+    )
+)
+# Corpus root. Override with OFFICIAL_DOC_CORPUS_DIR env var when running on
+# a different host (MBP, Linux mini-PC, future cloud VM). Default points at
+# the OneDrive mirror as seen from WSL2 on the Windows desktop.
+OFFICIAL_DOC_CORPUS_DIR = Path(
+    os.environ.get(
+        "OFFICIAL_DOC_CORPUS_DIR",
+        "/mnt/c/Users/natba/OneDrive/@ Cowork/openclaw-investing-context",
+    )
+)
+OFFICIAL_DOC_CORPUS_WINDOWS_DIR = os.environ.get(
+    "OFFICIAL_DOC_CORPUS_WINDOWS_DIR",
+    r"C:\Users\natba\OneDrive\@ Cowork\openclaw-investing-context",
+)
 
 # Inbox handoff uses portfolio-facing primary tickers where a coverage item is
 # represented by an ETF or sector alias rather than a single company ticker.
@@ -405,6 +422,8 @@ TICKER_META: dict[str, dict] = {
         "ir_page":  "https://www.sc.com/en/investors/financial-results/",
         "website_probe_urls": [
             "https://www.sc.com/en/investors/financial-results/",
+            "https://www.sc.com/en/investors/financial-results/annual-report/",
+            "https://www.sc.com/en/investors/events-and-presentations/",
         ],
         "exchange_adapter": "lse",
         "exchange_symbol": "STAN",
@@ -620,3 +639,31 @@ X_ACCOUNTS: dict[str, list[str]] = {
     "sectors/japan-banks": ["BOJ_q"],
     "sectors/gold-miners": [],
 }
+
+
+# ── Custom Tickers ────────────────────────────────────────────────────────────
+import json
+import os
+import logging
+
+CUSTOM_TICKERS_PATH = os.path.join(os.path.dirname(__file__), 'custom_tickers.json')
+if os.path.exists(CUSTOM_TICKERS_PATH):
+    try:
+        with open(CUSTOM_TICKERS_PATH, 'r', encoding='utf-8') as f:
+            custom_tickers = json.load(f)
+            TICKER_META.update(custom_tickers)
+    except Exception as e:
+        logging.getLogger("config").warning("Failed to load custom tickers: %s", e)
+
+def save_custom_ticker(coverage_key: str, spec_dict: dict) -> None:
+    custom_tickers = {}
+    if os.path.exists(CUSTOM_TICKERS_PATH):
+        try:
+            with open(CUSTOM_TICKERS_PATH, 'r', encoding='utf-8') as f:
+                custom_tickers = json.load(f)
+        except Exception:
+            pass
+    custom_tickers[coverage_key] = spec_dict
+    with open(CUSTOM_TICKERS_PATH, 'w', encoding='utf-8') as f:
+        json.dump(custom_tickers, f, indent=4)
+    TICKER_META[coverage_key] = spec_dict
