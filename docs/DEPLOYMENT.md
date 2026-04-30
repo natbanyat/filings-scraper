@@ -23,7 +23,7 @@ unauthenticated scraper on the network.
 | 2. Clients send `Authorization: Bearer` (skill + service.md) | ✅ Landed | `phase2-clients` |
 | 3. Default bind 0.0.0.0 + Tailscale install | 🟡 In progress | `phase3-bind-tailscale` |
 | 4. Cloudflare Tunnel for cloud Cowork | ✅ Landed | `phase4-cloudflared` |
-| 5. NSSM auto-start + power settings | ⬜ Pending | `phase5-nssm` |
+| 5. NSSM auto-start + power settings | ✅ Landed | `phase5-nssm` |
 | 6. Healthcheck + DEPLOYMENT.md rewrite + Notion | ⬜ Pending | `phase6-cleanup` |
 
 ---
@@ -192,10 +192,47 @@ curl -s -H "Authorization: Bearer $TOKEN" https://filings.<user-domain>.com/api/
 
 ---
 
-## Phase 5 — NSSM auto-start + power settings (pending)
+## Phase 5 — NSSM auto-start + power settings
 
-Wraps the WSL service launch in a Windows service that auto-starts on boot
-and auto-restarts on crash with backoff. Pending implementation.
+**Code (already landed):**
+
+- `scripts/start.sh` — WSL-side launcher. Loads `.env`, validates the token is set, activates the venv, execs the server with `--require-auth` on port 8876.
+- `windows/install_nssm_service.ps1` — PowerShell installer. Wraps `wsl.exe -d <distro> -u <user> -- bash -lc '<repo>/scripts/start.sh'` as a Windows service with auto-start, 5-second restart backoff, log rotation at 10 MB.
+
+**Operator steps:**
+
+1. Install NSSM:
+   ```powershell
+   winget install --id NSSM.NSSM
+   ```
+2. Run the installer as Administrator from PowerShell:
+   ```powershell
+   cd C:\path\to\filings-scraper-checkout
+   .\windows\install_nssm_service.ps1
+   ```
+   Adjust the `-WslDistro`, `-WslUser`, `-RepoPath` parameters if defaults don't match.
+3. Start the service:
+   ```powershell
+   sc start FilingsScraper
+   ```
+4. Verify it's up:
+   ```powershell
+   curl -s http://127.0.0.1:8876/health
+   curl -s http://127.0.0.1:8876/version
+   ```
+
+**Logs:** `%LOCALAPPDATA%\filings-scraper\logs\stdout.log` and `stderr.log`. Rotated automatically at 10 MB.
+
+**Restart policy:** auto-restart on crash with 5-second delay; throttle protects against tight crash loops (any restart in <10s after start counts toward the throttle).
+
+**Service runs as:** the logged-in user (so the WSL distro is reachable). Do not run NSSM as LocalSystem — WSL distros are per-user and the service won't find your distro.
+
+**Cold reboot test:** reboot the desktop, wait ~60 seconds, run `curl http://127.0.0.1:8876/health` from the host. Should return 200. If not, check `stderr.log` for the bootstrap error.
+
+**Uninstall:**
+```powershell
+.\windows\install_nssm_service.ps1 -Uninstall
+```
 
 ---
 
