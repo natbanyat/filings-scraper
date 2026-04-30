@@ -22,7 +22,7 @@ unauthenticated scraper on the network.
 | 1. Auth layer + `/version` + bind safety guard | ✅ Landed | `phase1-auth` |
 | 2. Clients send `Authorization: Bearer` (skill + service.md) | ✅ Landed | `phase2-clients` |
 | 3. Default bind 0.0.0.0 + Tailscale install | 🟡 In progress | `phase3-bind-tailscale` |
-| 4. Cloudflare Tunnel for cloud Cowork | ⬜ Pending | `phase4-cloudflared` |
+| 4. Cloudflare Tunnel for cloud Cowork | ✅ Landed | `phase4-cloudflared` |
 | 5. NSSM auto-start + power settings | ⬜ Pending | `phase5-nssm` |
 | 6. Healthcheck + DEPLOYMENT.md rewrite + Notion | ⬜ Pending | `phase6-cleanup` |
 
@@ -161,23 +161,34 @@ If the second-device test fails:
 
 ---
 
-## Phase 4 — Cloudflare Tunnel for cloud Cowork (pending)
+## Phase 4 — Cloudflare Tunnel for cloud Cowork
 
-Pending implementation. Will document once the tunnel is configured.
+**Code (already landed):**
 
-Required setup:
-- Cloudflare account
-- Domain managed in Cloudflare DNS
-- `cloudflared` binary installed as a Windows service
+- `cloudflared/config.example.yml` — ingress template (replace `<TUNNEL-UUID>`, `<USER>`, `<your-domain>.com`).
+- `cloudflared/README.md` — full one-time setup runbook including DNS routing, Windows service install, optional Cloudflare Access for additional zero-trust auth at the edge.
 
-Topology will be: cloud Cowork → `https://filings.<user-domain>.com` →
-Cloudflare edge → tunnel → cloudflared on Windows host →
-`http://localhost:8876` (which forwards into WSL via WSL2's transparent
-localhost handling).
+**Operator steps** (full version in `cloudflared/README.md`):
 
-Optional: Cloudflare Access in front of the public hostname adds a zero-trust
-email-auth layer on top of the bearer token (defense in depth, single-user
-allowlist).
+1. Install `cloudflared` on Windows (`winget install --id Cloudflare.cloudflared`).
+2. `cloudflared tunnel login` — opens browser to your Cloudflare account.
+3. `cloudflared tunnel create filings-scraper` — note the UUID.
+4. `cloudflared tunnel route dns filings-scraper filings.<your-domain>.com` — creates the CNAME.
+5. Copy `cloudflared/config.example.yml` to `C:\Users\<USER>\.cloudflared\config.yml`, fill the placeholders.
+6. Smoke test: `cloudflared tunnel run filings-scraper`.
+7. Install as Windows service: `cloudflared service install`.
+
+**Topology:** cloud Cowork → `https://filings.<user-domain>.com` → Cloudflare edge → tunnel → cloudflared on Windows host → `http://localhost:8876` (which forwards into WSL via WSL2 transparent localhost handling).
+
+**Verification (from any external client, including cloud Cowork):**
+
+```bash
+curl -s https://filings.<user-domain>.com/health                                # 200
+curl -s -o /dev/null -w "%{http_code}\n" https://filings.<user-domain>.com/api/companies  # 401
+curl -s -H "Authorization: Bearer $TOKEN" https://filings.<user-domain>.com/api/companies | head -c 200  # 200
+```
+
+**Optional Cloudflare Access** in front of the public hostname adds a zero-trust email-auth layer on top of the bearer token (defense in depth, single-user allowlist). Skip unless you want the dashboard UI exposed without bearer auth. Setup steps in `cloudflared/README.md`.
 
 ---
 

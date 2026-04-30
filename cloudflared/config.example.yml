@@ -1,0 +1,46 @@
+# Cloudflare Tunnel ingress config for the filings-scraper service.
+#
+# Copy to ~/.cloudflared/config.yml on the Windows host (typically
+# C:\Users\<user>\.cloudflared\config.yml) AFTER running:
+#
+#   cloudflared tunnel login
+#   cloudflared tunnel create filings-scraper
+#   cloudflared tunnel route dns filings-scraper filings.<your-domain>.com
+#
+# Then start the tunnel:
+#   cloudflared tunnel run filings-scraper
+#
+# Or install as a Windows service so it survives reboot:
+#   cloudflared service install
+#
+# The service binds to localhost:8876 because cloudflared runs on the
+# Windows host and reaches WSL via WSL2 transparent localhost forwarding.
+# (If you ever move cloudflared inside WSL, change the service URL to
+# the WSL host's tailnet IP or 127.0.0.1 from inside WSL.)
+
+# Replace <TUNNEL-UUID> with the UUID printed by `cloudflared tunnel create`.
+# Replace <USER> with your Windows username.
+tunnel: <TUNNEL-UUID>
+credentials-file: C:\Users\<USER>\.cloudflared\<TUNNEL-UUID>.json
+
+# Optional connection tuning. Defaults are reasonable; uncomment only if
+# you observe issues.
+# protocol: quic                # default; falls back to http2 automatically
+# warp-routing:
+#   enabled: false              # not needed for this use case
+# loglevel: info
+
+ingress:
+  # Public hostname pointed at the local service.
+  # Replace <your-domain>.com with the domain you control in Cloudflare DNS.
+  - hostname: filings.<your-domain>.com
+    service: http://localhost:8876
+    originRequest:
+      # The service uses long polling for runs; prevent premature timeouts.
+      connectTimeout: 10s
+      tlsTimeout: 10s
+      noTLSVerify: true   # connecting to localhost http; not internet-bound
+      httpHostHeader: localhost:8876
+
+  # Catch-all: deny anything else to keep the tunnel scoped to one host.
+  - service: http_status:404
