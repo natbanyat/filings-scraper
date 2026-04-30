@@ -18,10 +18,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
+import os
 import subprocess
 import sys
+import time
 import uuid
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 from aiohttp import web
@@ -30,6 +34,16 @@ WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = WORKSPACE_ROOT / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
+
+# Best-effort .env load so FILINGS_SCRAPER_TOKEN, FILINGS_SCRAPER_URL, and
+# OFFICIAL_DOC_CORPUS_DIR can live in a per-host .env file rather than being
+# baked into a shell profile or systemd unit. python-dotenv is already in
+# requirements.txt so this is non-additive on the dependency side.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(WORKSPACE_ROOT / ".env")
+except ImportError:
+    pass
 
 from config import OFFICIAL_DOC_CORPUS_DIR, OFFICIAL_DOC_CORPUS_WINDOWS_DIR, TICKER_META  # noqa: E402
 from official_doc_corpus import (  # noqa: E402
@@ -41,8 +55,115 @@ from official_doc_corpus import (  # noqa: E402
     list_runs,
 )
 
+log = logging.getLogger("official_docs_server")
+
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8876
+
+# ---------------------------------------------------------------------------
+# Auth + version
+# ---------------------------------------------------------------------------
+
+# Endpoints reachable without a bearer token. Health and version are exposed
+# so external monitors / load balancers / cloudflared can probe liveness
+# without a credential. Everything else requires Authorization: Bearer.
+_AUTH_ALLOWLIST = {"/health", "/version"}
+
+# Captured at process start so /version reflects the running build, not the
+# commit that's checked out at request time (which can drift if the repo is
+# updated under a still-running service).
+SERVICE_STARTED_AT = datetime.now(timezone.utc).isoformat()
+
+
+def _resolve_commit_sha() -> str:
+    """Best-effort git commit SHA capture for /version. Falls back to env or
+    'unknown' if git isn't available (e.g. inside a packaged deploy)."""
+    env_sha = os.environ.get("FILINGS_SCRAPER_COMMIT_SHA")
+    if env_sha:
+        return env_sha
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(WORKSPACE_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip() or "unknown"
+    except Exception:
+        pass
+    return "unknown"
+
+
+SERVICE_COMMIT_SHA = _resolve_commit_sha()
+
+
+@web.middleware
+async def bearer_auth_middleware(request: web.Request, handler):
+    """Bearer-token auth for everything outside the allowlist.
+
+    Behavior matrix:
+      - FILINGS_SCRAPER_TOKEN unset:
+          - If REQUIRE_AUTH (--require-auth) is True: return 503 (refuses to
+            serve unauthenticated). This is what production gets so we never
+            silently expose 0.0.0.0 unauth'd.
+          - If REQUIRE_AUTH is False: pass through with a WARN log on the
+            first request only. This is the dev-mode bypass.
+      - FILINGS_SCRAPER_TOKEN set:
+          - Allowlisted paths skip auth.
+          - All other paths require `Authorization: Bearer <token>`.
+            Missing / mismatched -> 401.
+    """
+    path = request.path
+    if path in _AUTH_ALLOWLIST:
+        return await handler(request)
+
+    expected_token = os.environ.get("FILINGS_SCRAPER_TOKEN", "").strip()
+    require_auth = request.app.get("require_auth", False)
+
+    if not expected_token:
+        if require_auth:
+            return json_response(
+                {"error": "service is configured with --require-auth but FILINGS_SCRAPER_TOKEN is not set; refusing to serve."},
+                status=503,
+            )
+        # Dev-mode passthrough. Log once per process to avoid log spam.
+        if not request.app.get("_logged_unauth_warning", False):
+            log.warning(
+                "FILINGS_SCRAPER_TOKEN not set and --require-auth=false: serving unauthenticated. "
+                "DO NOT use this configuration on a 0.0.0.0 bind or any non-localhost interface."
+            )
+            request.app["_logged_unauth_warning"] = True
+        return await handler(request)
+
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return json_response(
+            {"error": "missing Authorization: Bearer <token> header"},
+            status=401,
+        )
+    presented = auth_header[len("Bearer "):].strip()
+    # Constant-time compare to avoid timing-side-channel on token guess.
+    import hmac
+    if not hmac.compare_digest(presented, expected_token):
+        return json_response({"error": "invalid token"}, status=401)
+
+    return await handler(request)
+
+
+async def health(_: web.Request) -> web.Response:
+    return json_response({"ok": True})
+
+
+async def version_endpoint(_: web.Request) -> web.Response:
+    return json_response({
+        "commit_sha": SERVICE_COMMIT_SHA,
+        "started_at": SERVICE_STARTED_AT,
+        "python_version": sys.version.split()[0],
+        "auth_required": bool(os.environ.get("FILINGS_SCRAPER_TOKEN", "").strip()),
+        "host": os.environ.get("HOSTNAME") or os.uname().nodename if hasattr(os, "uname") else "unknown",
+    })
 
 
 def json_response(payload: dict | list, status: int = 200) -> web.Response:
@@ -1126,15 +1247,13 @@ async def file_handler(request: web.Request) -> web.StreamResponse:
     return web.FileResponse(path)
 
 
-async def health(_: web.Request) -> web.Response:
-    return json_response({"ok": True})
-
-
-def build_app() -> web.Application:
-    app = web.Application(client_max_size=10 * 1024 * 1024)
+def build_app(*, require_auth: bool = False) -> web.Application:
+    app = web.Application(client_max_size=10 * 1024 * 1024, middlewares=[bearer_auth_middleware])
+    app["require_auth"] = require_auth
     app.add_routes([
         web.get("/", index),
         web.get("/health", health),
+        web.get("/version", version_endpoint),
         web.get("/api/summary", api_summary),
         web.get("/api/runs", api_runs),
         web.get("/api/documents", api_documents),
@@ -1154,12 +1273,57 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Serve the official documents corpus UI")
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", default=DEFAULT_PORT, type=int)
+    parser.add_argument(
+        "--require-auth",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Require Authorization: Bearer header for all non-allowlisted endpoints. "
+            "Default: True if FILINGS_SCRAPER_TOKEN is set in env, False otherwise. "
+            "MUST be True for any non-localhost bind (Tailscale, Cloudflare Tunnel, LAN)."
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-7s %(name)s  %(message)s",
+    )
     args = parse_args()
-    web.run_app(build_app(), host=args.host, port=args.port)
+
+    # Resolve --require-auth: explicit CLI flag wins; otherwise default
+    # follows whether FILINGS_SCRAPER_TOKEN is set.
+    if args.require_auth is None:
+        token_present = bool(os.environ.get("FILINGS_SCRAPER_TOKEN", "").strip())
+        require_auth = token_present
+    else:
+        require_auth = args.require_auth
+
+    # Hard safety check: refuse to run an unauth service on a non-localhost bind.
+    # This is the second line of defense beyond the middleware's own 503 path.
+    if not require_auth and args.host not in ("127.0.0.1", "localhost", "::1"):
+        log.error(
+            "Refusing to serve unauthenticated on non-localhost bind %s:%d. "
+            "Either set FILINGS_SCRAPER_TOKEN in env, pass --require-auth, "
+            "or bind to 127.0.0.1.",
+            args.host, args.port,
+        )
+        sys.exit(2)
+
+    if require_auth and not os.environ.get("FILINGS_SCRAPER_TOKEN", "").strip():
+        log.error(
+            "--require-auth requested but FILINGS_SCRAPER_TOKEN is not set in env. "
+            "Set the token (in .env or shell env) before starting the service."
+        )
+        sys.exit(2)
+
+    log.info(
+        "Starting filings-scraper server on %s:%d (require_auth=%s, commit=%s)",
+        args.host, args.port, require_auth, SERVICE_COMMIT_SHA,
+    )
+    web.run_app(build_app(require_auth=require_auth), host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
