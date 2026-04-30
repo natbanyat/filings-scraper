@@ -57,7 +57,12 @@ from official_doc_corpus import (  # noqa: E402
 
 log = logging.getLogger("official_docs_server")
 
-DEFAULT_HOST = "127.0.0.1"
+# Default bind: 0.0.0.0 so Tailscale and Cloudflare Tunnel both work without
+# extra config. The bind safety guard in main() refuses to start with this
+# default unless FILINGS_SCRAPER_TOKEN is set or --require-auth is False AND
+# --host is forced back to 127.0.0.1. So flipping the default to 0.0.0.0 is
+# safe — the unauth path is structurally blocked.
+DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8876
 
 # ---------------------------------------------------------------------------
