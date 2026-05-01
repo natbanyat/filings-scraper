@@ -192,46 +192,81 @@ curl -s -H "Authorization: Bearer $TOKEN" https://filings.<user-domain>.com/api/
 
 ---
 
-## Phase 5 — NSSM auto-start + power settings
+## Phase 5 — Auto-start (Task Scheduler OR NSSM)
+
+WSL distros are per-user. **LocalSystem cannot reach them** — `wsl.exe` from a LocalSystem context returns `WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED`. So the service must run as your user account, which gives two options:
+
+| Option | Password storage | Runs when no one is logged on | Recommended for |
+|---|---|---|---|
+| **Task Scheduler** (`install_scheduled_task.ps1`) | None (LogonType Interactive) | No — task waits for login | Personal desktop you sit at daily |
+| **NSSM** (`install_nssm_service.ps1`) | Yes (encrypted in registry) | Yes | Headless server, multi-user box |
 
 **Code (already landed):**
 
-- `scripts/start.sh` — WSL-side launcher. Loads `.env`, validates the token is set, activates the venv, execs the server with `--require-auth` on port 8876.
-- `windows/install_nssm_service.ps1` — PowerShell installer. Wraps `wsl.exe -d <distro> -u <user> -- bash -lc '<repo>/scripts/start.sh'` as a Windows service with auto-start, 5-second restart backoff, log rotation at 10 MB.
+- `scripts/start.sh` — WSL-side launcher. Loads `.env`, validates the token, activates the venv, execs the server with `--require-auth` on port 8876.
+- `windows/install_scheduled_task.ps1` — Scheduled Task installer (no password).
+- `windows/install_nssm_service.ps1` — NSSM service installer (password required).
 
-**Operator steps:**
+### Option A — Task Scheduler (recommended for personal desktop)
 
-1. Install NSSM:
-   ```powershell
-   winget install --id NSSM.NSSM
-   ```
-2. Run the installer as Administrator from PowerShell:
-   ```powershell
-   cd C:\path\to\filings-scraper-checkout
-   .\windows\install_nssm_service.ps1
-   ```
-   Adjust the `-WslDistro`, `-WslUser`, `-RepoPath` parameters if defaults don't match.
-3. Start the service:
-   ```powershell
-   sc start FilingsScraper
-   ```
-4. Verify it's up:
-   ```powershell
-   curl -s http://127.0.0.1:8876/health
-   curl -s http://127.0.0.1:8876/version
-   ```
-
-**Logs:** `%LOCALAPPDATA%\filings-scraper\logs\stdout.log` and `stderr.log`. Rotated automatically at 10 MB.
-
-**Restart policy:** auto-restart on crash with 5-second delay; throttle protects against tight crash loops (any restart in <10s after start counts toward the throttle).
-
-**Service runs as:** the logged-in user (so the WSL distro is reachable). Do not run NSSM as LocalSystem — WSL distros are per-user and the service won't find your distro.
-
-**Cold reboot test:** reboot the desktop, wait ~60 seconds, run `curl http://127.0.0.1:8876/health` from the host. Should return 200. If not, check `stderr.log` for the bootstrap error.
-
-**Uninstall:**
 ```powershell
-.\windows\install_nssm_service.ps1 -Uninstall
+cd \\wsl$\Ubuntu-24.04\home\natbanyat\.openclaw\workspace-investing
+.\windows\install_scheduled_task.ps1
+
+# Start now and verify
+Start-ScheduledTask -TaskName "FilingsScraper"
+Start-Sleep -Seconds 6
+Get-ScheduledTaskInfo -TaskName "FilingsScraper" | Select-Object LastRunTime,LastTaskResult
+curl.exe -s http://127.0.0.1:8876/version
+```
+
+`LastTaskResult: 0` → started cleanly. Service auto-starts at every logon afterwards. Restart-on-failure: 5 retries with 1-minute backoff.
+
+Uninstall: `.\install_scheduled_task.ps1 -Uninstall`
+
+### Option B — NSSM (Windows service, persists when logged off)
+
+```powershell
+winget install --id NSSM.NSSM
+cd \\wsl$\Ubuntu-24.04\home\natbanyat\.openclaw\workspace-investing
+.\windows\install_nssm_service.ps1
+# You'll be prompted for your Windows password — required because
+# LocalSystem cannot reach WSL distros.
+
+sc.exe start FilingsScraper
+Start-Sleep -Seconds 6
+curl.exe -s http://127.0.0.1:8876/version
+```
+
+**Logs:** `%LOCALAPPDATA%\filings-scraper\logs\stdout.log` and `stderr.log`, rotated at 10 MB.
+
+**Restart policy:** 5s backoff; throttle treats restarts within 10s as failures.
+
+Uninstall: `.\install_nssm_service.ps1 -Uninstall`
+
+### Power settings (both options)
+
+```powershell
+# Disable sleep on AC power, hibernate off
+powercfg /change standby-timeout-ac 0
+powercfg /hibernate off
+```
+
+### Cold-reboot test
+
+Reboot the desktop. With Task Scheduler, log in once. Within ~30 seconds:
+
+```powershell
+curl.exe -s http://127.0.0.1:8876/health
+# {"ok": true}
+```
+
+If 404 or no response, check the log:
+
+```powershell
+# NSSM:
+Get-Content $env:LOCALAPPDATA\filings-scraper\logs\stderr.log -Tail 30
+# Task Scheduler: open Task Scheduler GUI -> Task -> History tab
 ```
 
 ---

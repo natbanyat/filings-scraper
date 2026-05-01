@@ -1,11 +1,19 @@
 # PowerShell — install the filings-scraper service via NSSM.
 #
+# IMPORTANT: this path requires storing your Windows password in NSSM
+# because LocalSystem cannot reach a per-user WSL distro
+# (WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED). If you don't want to store the
+# password, use install_scheduled_task.ps1 instead — same outcome,
+# different mechanism, no password.
+#
 # Prerequisites:
 #   - NSSM installed: `winget install --id NSSM.NSSM` or download from
 #     https://nssm.cc/download
 #   - WSL2 distro 'Ubuntu-24.04' (or your distro name) with the
 #     workspace at /home/<user>/.openclaw/workspace-investing
 #   - .env file at the repo root with FILINGS_SCRAPER_TOKEN set
+#   - The Windows password for the account the service will run as.
+#     Pass via -Credential (Get-Credential prompt) or interactively.
 #
 # Run as Administrator:
 #   .\install_nssm_service.ps1
@@ -18,6 +26,7 @@ param(
     [string]$WslDistro    = "Ubuntu-24.04",
     [string]$WslUser      = "natbanyat",
     [string]$RepoPath     = "/home/natbanyat/.openclaw/workspace-investing",
+    [System.Management.Automation.PSCredential]$Credential,
     [switch]$Uninstall
 )
 
@@ -51,15 +60,33 @@ Write-Host "  RepoPath: $RepoPath"
 $logDir = Join-Path $env:LOCALAPPDATA "filings-scraper\logs"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 
+# Acquire credentials interactively if not passed via -Credential.
+if (-not $Credential) {
+    Write-Host ""
+    Write-Host "WSL distros are per-user, so the service must run as your account."
+    Write-Host "LocalSystem WILL NOT WORK (errors with WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED)."
+    Write-Host "Enter the password for $env:USERDOMAIN\$env:USERNAME:"
+    $Credential = Get-Credential -UserName "$env:USERDOMAIN\$env:USERNAME" `
+        -Message "Windows password for the FilingsScraper service. Stored encrypted in NSSM registry."
+    if (-not $Credential) {
+        Write-Error "Credential entry cancelled. Aborting."
+    }
+}
+$svcUser = $Credential.UserName
+$svcPwd  = $Credential.GetNetworkCredential().Password
+
 # Install or recreate.
 & $nssm install $ServiceName $wslExe $wslArgs
 & $nssm set $ServiceName Description "Filings-scraper aiohttp service running inside WSL2 ($WslDistro)."
 & $nssm set $ServiceName Start SERVICE_AUTO_START
-& $nssm set $ServiceName ObjectName ".\$env:USERNAME"   # run as the logged-in user (WSL distro is per-user)
-# Note: NSSM will prompt for password when ObjectName is the current user
-# unless you set it via Set-Service / sc.exe with stored credentials.
-# For a single-user desktop, running as LocalSystem may not work because
-# WSL distros are per-user. Document this in DEPLOYMENT.md.
+# ObjectName needs both username and password in a single NSSM call,
+# otherwise NSSM logs "Setting ObjectName requires both a username and
+# password!" and silently leaves the service running as LocalSystem,
+# which cannot reach WSL.
+& $nssm set $ServiceName ObjectName $svcUser $svcPwd
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "NSSM set ObjectName failed (exit $LASTEXITCODE). Service will run as LocalSystem and crash. Fix manually with: nssm.exe edit $ServiceName"
+}
 
 # Restart policy: aggressive but capped.
 & $nssm set $ServiceName AppStopMethodSkip 0
